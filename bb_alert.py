@@ -11,253 +11,205 @@ BB_PASS = os.environ.get("BB_PASS", "")
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN",   "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-LIMA_TZ = pytz.timezone("America/Lima")
-
-
+# ---------------------------------------------------------------------------
 async def login(page):
     print("[LOGIN] Abriendo pagina de login...")
-    await page.goto(BB_URL, wait_until="networkidle", timeout=60000)
-    await page.wait_for_timeout(2000)
+    await page.goto(BB_URL, wait_until="domcontentloaded", timeout=60000)
+    await page.wait_for_selector('#loginid', timeout=30000)
 
-    # Intentar login con formulario estandar
+    # Cerrar cualquier overlay/lightbox que bloquee el boton de login
     try:
-        await page.fill('input[name="user_id"], input[id="user_id"], input[type="text"]', BB_USER, timeout=10000)
-        await page.fill('input[name="password"], input[id="password"], input[type="password"]', BB_PASS, timeout=10000)
-        await page.click('button[type="submit"], input[type="submit"], #entry-login', timeout=10000)
-        await page.wait_for_load_state("networkidle", timeout=30000)
-        print("[LOGIN] Login completado.")
-    except Exception as e:
-        print(f"[LOGIN] Error en login estandar: {e}")
-        raise
+        overlay = page.locator('div.lb-wrapper[role="dialog"]')
+        if await overlay.count() > 0:
+            print("[LOGIN] Cerrando dialogo superpuesto...")
+            await page.keyboard.press('Escape')
+            await page.wait_for_timeout(1000)
+    except Exception:
+        pass
 
+    # Cerrar cookie banners comunes
+    try:
+        for sel in ['button#onetrust-accept-btn-handler',
+                    'button.accept-cookies',
+                    'button[aria-label*="Accept"]']:
+            el = page.locator(sel)
+            if await el.count() > 0:
+                await el.click()
+                await page.wait_for_timeout(500)
+                break
+    except Exception:
+        pass
 
+    await page.fill('#loginid', BB_USER)
+    await page.fill('#pass', BB_PASS)
+
+    # JS click para evitar que overlays intercepten el evento de puntero
+    try:
+        await page.evaluate("document.querySelector('#entry-login').click()")
+    except Exception:
+        await page.locator('#pass').press('Enter')
+
+    await page.wait_for_load_state('networkidle', timeout=60000)
+    print("[LOGIN] Login completado")
+
+# ---------------------------------------------------------------------------
 async def get_all_courses(page):
     print("[CURSOS] Buscando cursos activos...")
     courses = []
 
     try:
-        await page.goto(BB_URL + "/ultra/course", wait_until="networkidle", timeout=60000)
-        await page.wait_for_timeout(3000)
-
-        # Buscar todos los enlaces de cursos en la lista de cursos de Blackboard Ultra
-        course_links = await page.query_selector_all('a[href*="/ultra/courses/"][href*="/cl/outline"]')
-
-        if not course_links:
-            # Intentar selector alternativo
-            course_links = await page.query_selector_all('a[href*="courses/"][href*="outline"]')
-
-        for link in course_links:
-            href = await link.get_attribute("href")
-            # Extraer course_id del href
-            match = re.search(r'/courses/([^/]+)/', href)
-            if match:
-                course_id = match.group(1)
-                # Intentar obtener el nombre del curso
-                name_el = await link.query_selector('span, div, h3, h4')
-                course_name = await name_el.inner_text() if name_el else course_id
-                course_name = course_name.strip().replace("\n", " ")
-                courses.append({"id": course_id, "name": course_name, "url": href})
-                print(f"  Curso encontrado: {course_name} ({course_id})")
-
+        import json
+        api_url = BB_URL.rstrip('/') + '/learn/api/public/v1/courses?availability.available=Yes&fields=id,name,courseId&limit=100'
+        resp = await page.evaluate(f"""
+            fetch('{api_url}', {{credentials: 'include'}})
+              .then(r => r.json())
+              .then(d => JSON.stringify(d))
+              .catch(e => JSON.stringify({{error: e.toString()}}))
+        """)
+        data = json.loads(resp)
+        if 'results' in data:
+            for c in data['results']:
+                courses.append({{'id': c['id'], 'name': c.get('name', c.get('courseId', 'Sin nombre'))}})
+            print(f"[CURSOS] Encontrados {{len(courses)}} cursos via API")
+            return courses
     except Exception as e:
-        print(f"[CURSOS] Error obteniendo cursos: {e}")
-
-    if not courses:
-        print("[CURSOS] No se encontraron cursos por selector. Intentando via API...")
-        try:
-            # Blackboard Ultra expone datos via API interna
-            api_resp = await page.evaluate("""
-                async () => {
-                    const r = await fetch('/learn/api/public/v1/courses?availability.available=Yes&fields=id,courseId,name&limit=100', {
-                        credentials: 'include'
-                    });
-                    if (!r.ok) return null;
-                    return await r.json();
-                }
-            """)
-            if api_resp and "results" in api_resp:
-                for c in api_resp["results"]:
-                    courses.append({
-                        "id": c.get("id", ""),
-                        "name": c.get("name", c.get("courseId", "")),
-                        "url": f"/ultra/courses/{c.get('id', '')}/cl/outline"
-                    })
-                    print(f"  Curso via API: {c.get('name', '')} ({c.get('id', '')})")
-        except Exception as e2:
-            print(f"[CURSOS] Error via API: {e2}")
-
-    print(f"[CURSOS] Total cursos encontrados: {len(courses)}")
-    return courses
-
-
-async def get_gradebook_items(page, course_id, course_name):
-    print(f"[GRADEBOOK] Revisando: {course_name}")
-    items = []
+        print(f"[CURSOS] API no disponible: {{e}}")
 
     try:
-        gradebook_url = f"{BB_URL}/ultra/courses/{course_id}/grade/gradebook"
-        await page.goto(gradebook_url, wait_until="networkidle", timeout=60000)
+        await page.goto(BB_URL.rstrip('/') + '/ultra/stream', wait_until='networkidle', timeout=60000)
         await page.wait_for_timeout(3000)
-
-        # Buscar columnas/actividades en el gradebook
-        rows = await page.query_selector_all('[data-bbtype="column"], .gradebook-row, [class*="gradable"], [class*="activity"]')
-
-        now_lima = datetime.now(LIMA_TZ)
-
-        for row in rows:
-            try:
-                # Nombre de la actividad
-                name_el = await row.query_selector('[class*="title"], [class*="name"], span, div')
-                act_name = (await name_el.inner_text()).strip() if name_el else "Actividad sin nombre"
-
-                # Fecha limite
-                due_el = await row.query_selector('[class*="due"], [class*="date"], time')
-                due_text = ""
-                if due_el:
-                    due_text = (await due_el.inner_text()).strip()
-                    if not due_text:
-                        due_text = await due_el.get_attribute("datetime") or ""
-
-                # Verificar si ya tiene nota (si la celda de nota esta vacia = pendiente)
-                score_el = await row.query_selector('[class*="score"], [class*="grade"], [aria-label*="grade"]')
-                score_text = (await score_el.inner_text()).strip() if score_el else ""
-
-                is_pending = not score_text or score_text in ["-", "", "–", "—"]
-
-                if is_pending and act_name and len(act_name) > 2:
-                    items.append({
-                        "curso": course_name,
-                        "actividad": act_name,
-                        "fecha_limite": due_text or "Sin fecha",
-                    })
-            except Exception:
-                continue
-
+        links = await page.evaluate("""
+            () => {
+                const anchors = document.querySelectorAll('a[href*="/ultra/courses/"]');
+                const seen = new Set();
+                const result = [];
+                anchors.forEach(a => {
+                    const m = a.href.match(/\/ultra\/courses\/([^/]+)/);
+                    if (m && !seen.has(m[1])) {
+                        seen.add(m[1]);
+                        result.push({id: m[1], name: a.textContent.trim() || m[1]});
+                    }
+                });
+                return result;
+            }
+        """)
+        if links:
+            courses = links
+            print(f"[CURSOS] Encontrados {{len(courses)}} cursos via scraping")
+            return courses
     except Exception as e:
-        print(f"[GRADEBOOK] Error en {course_name}: {e}")
+        print(f"[CURSOS] Scraping fallback error: {{e}}")
 
-    print(f"  Pendientes encontrados: {len(items)}")
+    print("[CURSOS] No se encontraron cursos")
+    return courses
+
+# ---------------------------------------------------------------------------
+async def get_gradebook_items(page, course_id, course_name):
+    print(f"[GRADEBOOK] Revisando: {{course_name}}")
+    items = []
+    try:
+        url = f"{{BB_URL.rstrip('/')}}/ultra/courses/{{course_id}}/grade/gradebook"
+        await page.goto(url, wait_until='networkidle', timeout=60000)
+        await page.wait_for_timeout(3000)
+        raw = await page.evaluate("""
+            () => {
+                const result = [];
+                const rows = document.querySelectorAll('[class*="gradebook-row"], [class*="grade-row"], tr[data-item-id]');
+                rows.forEach(row => {
+                    const nameEl  = row.querySelector('[class*="title"], [class*="name"], td:first-child');
+                    const scoreEl = row.querySelector('[class*="score"], [class*="grade"], td:nth-child(2)');
+                    const dueEl   = row.querySelector('[class*="due"], [class*="date"]');
+                    if (nameEl) {
+                        const score = scoreEl ? scoreEl.textContent.trim() : '';
+                        const pending = !score || score === '-' || score === '';
+                        if (pending) result.push({
+                            name: nameEl.textContent.trim(),
+                            due:  dueEl ? dueEl.textContent.trim() : 'Sin fecha'
+                        });
+                    }
+                });
+                return result;
+            }
+        """)
+        items = raw if isinstance(raw, list) else []
+        print(f"[GRADEBOOK] {{len(items)}} pendientes en {{course_name}}")
+    except Exception as e:
+        print(f"[GRADEBOOK] Error en {{course_name}}: {{e}}")
     return items
 
-
+# ---------------------------------------------------------------------------
 def format_report(all_items, total_courses):
-    now_lima = datetime.now(LIMA_TZ)
-    fecha_str = now_lima.strftime("%d/%m/%Y %H:%M")
-
-    if not all_items:
-        msg = (
-            f"<b>✅ Reporte Semanal MBA - UP</b>\n"
-            f"<i>{fecha_str} (hora Lima)</i>\n\n"
-            f"🎉 <b>No hay actividades pendientes</b> en ninguno de los {total_courses} cursos.\n\n"
-            f"¡Todo al día! 📚"
-        )
-        return msg
-
-    # Agrupar por curso
-    cursos_dict = {}
-    for item in all_items:
-        c = item["curso"]
-        if c not in cursos_dict:
-            cursos_dict[c] = []
-        cursos_dict[c].append(item)
-
+    lima_tz = pytz.timezone('America/Lima')
+    now     = datetime.now(lima_tz)
+    fecha   = now.strftime('%d/%m/%Y %H:%M')
     lines = [
-        f"<b>📋 Reporte Semanal MBA - UP</b>",
-        f"<i>{fecha_str} (hora Lima)</i>",
-        f"",
-        f"Cursos revisados: <b>{total_courses}</b> | Pendientes: <b>{len(all_items)}</b>",
-        f"",
+        "<b>📚 Reporte MBA - UP</b>",
+        f"<i>{{fecha}} (Lima)</i>",
+        f"Cursos revisados: {{total_courses}}",
+        ""
     ]
-
-    for curso, actividades in cursos_dict.items():
-        lines.append(f"<b>📖 {curso}</b>")
-        for act in actividades:
-            fecha = act['fecha_limite']
-            lines.append(f"  • {act['actividad']}")
-            if fecha and fecha != "Sin fecha":
-                lines.append(f"    📅 Vence: {fecha}")
-        lines.append("")
-
-    lines.append("—")
-    lines.append("Bot Alertas UP MBA 🤖")
-
+    if not all_items:
+        lines.append("✅ <b>No hay tareas pendientes</b> en el gradebook.")
+    else:
+        for course_name, items in all_items.items():
+            if items:
+                lines.append(f"\n<b>📖 {{course_name}}</b>")
+                for item in items:
+                    lines.append(f"  ⏰ {{item.get('name','?')}} — {{item.get('due','Sin fecha')}}")
+    lines += ["", "🤖 <i>Bot Alertas MBA - Universidad del Pacífico</i>"]
     return "\n".join(lines)
 
-
-async def send_telegram(message):
+# ---------------------------------------------------------------------------
+def send_telegram(message):
     import urllib.request, urllib.parse, json
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = urllib.parse.urlencode({
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-    }).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method="POST")
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        result = json.loads(resp.read())
-        if result.get("ok"):
-            print("[TELEGRAM] Mensaje enviado correctamente.")
+    url  = f"https://api.telegram.org/bot{{TELEGRAM_TOKEN}}/sendMessage"
+    data = urllib.parse.urlencode({{'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'HTML'}}).encode()
+    req  = urllib.request.Request(url, data=data, method='POST')
+    with urllib.request.urlopen(req, timeout=30) as r:
+        res = json.loads(r.read())
+        if res.get('ok'):
+            print("[TELEGRAM] Enviado OK")
         else:
-            print(f"[TELEGRAM] Error: {result}")
+            print(f"[TELEGRAM] Error: {{res}}")
 
-
+# ---------------------------------------------------------------------------
 async def main():
     print("=" * 60)
     print("Bot Alertas MBA - Universidad del Pacifico")
     print("=" * 60)
-
-    if not BB_USER or not BB_PASS:
-        raise ValueError("BB_USER y BB_PASS son obligatorios")
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        raise ValueError("TELEGRAM_TOKEN y TELEGRAM_CHAT_ID son obligatorios")
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+            args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
         )
         context = await browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            viewport={{'width': 1280, 'height': 900}},
+            user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36'
         )
         page = await context.new_page()
-
+        page.set_default_timeout(60000)
         try:
             await login(page)
             courses = await get_all_courses(page)
-
             if not courses:
-                msg = (
-                    "⚠️ <b>Bot Alertas MBA UP</b>\n"
-                    "No se encontraron cursos activos.\n"
-                    "Verifica que la sesion haya iniciado correctamente."
-                )
-                await send_telegram(msg)
+                send_telegram("<b>📚 Reporte MBA</b>\n\n⚠️ No se encontraron cursos activos.")
                 return
-
-            all_items = []
-            for course in courses:
-                items = await get_gradebook_items(page, course["id"], course["name"])
-                all_items.extend(items)
-
+            all_items = {{}}
+            for c in courses:
+                items = await get_gradebook_items(page, c['id'], c['name'])
+                if items:
+                    all_items[c['name']] = items
             report = format_report(all_items, len(courses))
-            print("\n--- REPORTE ---")
-            print(report)
-            print("---------------\n")
-
-            await send_telegram(report)
-
+            print("\n" + report)
+            send_telegram(report)
         except Exception as e:
-            print(f"[ERROR] {e}")
-            error_msg = f"❌ <b>Error en Bot Alertas MBA UP</b>\n<code>{str(e)[:200]}</code>"
+            import traceback; traceback.print_exc()
             try:
-                await send_telegram(error_msg)
+                send_telegram(f"<b>❌ Error Bot MBA</b>\n<code>{{str(e)[:200]}}</code>")
             except Exception:
                 pass
             raise
         finally:
             await browser.close()
 
-
-if __name__ == "__main__":
-    asyncio.run(main())
+asyncio.run(main())
