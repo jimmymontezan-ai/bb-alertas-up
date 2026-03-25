@@ -1,10 +1,4 @@
-import asyncio
-import os
-import re
-import json
-import pytz
-import urllib.request
-import urllib.parse
+import asyncio, os, re, json, pytz, urllib.request, urllib.parse
 from datetime import datetime
 from playwright.async_api import async_playwright
 
@@ -17,8 +11,33 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 # ---------------------------------------------------------------------------
 async def login(page):
     print("[LOGIN] Abriendo pagina de login...")
-    await page.goto(BB_URL, wait_until="domcontentloaded", timeout=60000)
-    await page.wait_for_selector("#loginid", timeout=30000)
+    # Use 'load' to wait for JS resources to execute (not just DOMContentLoaded)
+    try:
+        await page.goto(BB_URL, wait_until="load", timeout=60000)
+    except Exception as e:
+        print(f"[LOGIN] goto con 'load' fallo ({e}), reintentando con domcontentloaded...")
+        await page.goto(BB_URL, wait_until="domcontentloaded", timeout=60000)
+
+    await page.wait_for_timeout(3000)
+    print(f"[LOGIN] URL tras goto: {page.url}")
+    print(f"[LOGIN] Titulo: {await page.title()}")
+
+    # Try to find the login field - fall back to direct login URL if missing
+    try:
+        await page.wait_for_selector("#loginid", timeout=20000)
+        print("[LOGIN] Formulario encontrado en URL principal")
+    except Exception:
+        print(f"[LOGIN] #loginid no visible en {page.url}, navegando a /webapps/login/")
+        direct_login = BB_URL.rstrip("/") + "/webapps/login/"
+        try:
+            await page.goto(direct_login, wait_until="load", timeout=60000)
+        except Exception as e2:
+            print(f"[LOGIN] goto direct_login fallo ({e2}), usando domcontentloaded")
+            await page.goto(direct_login, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(3000)
+        print(f"[LOGIN] URL login directo: {page.url}")
+        await page.wait_for_selector("#loginid", timeout=30000)
+        print("[LOGIN] Formulario encontrado en URL directa")
 
     # Cerrar overlay lb-wrapper si existe
     try:
@@ -32,15 +51,13 @@ async def login(page):
 
     await page.fill("#loginid", BB_USER)
     await page.fill("#pass", BB_PASS)
-
     # JS click para bypassar overlays que interceptan pointer events
     try:
         await page.evaluate("document.querySelector('#entry-login').click()")
     except Exception:
         await page.locator("#pass").press("Enter")
-
     await page.wait_for_load_state("networkidle", timeout=60000)
-    print("[LOGIN] Login completado")
+    print(f"[LOGIN] Login completado. URL: {page.url}")
 
 # ---------------------------------------------------------------------------
 async def get_all_courses(page):
@@ -49,7 +66,7 @@ async def get_all_courses(page):
     try:
         api_url = BB_URL.rstrip("/") + "/learn/api/public/v1/courses?availability.available=Yes&fields=id,name,courseId&limit=100"
         resp = await page.evaluate(
-            "fetch('" + api_url.replace("'","\'") + "', {credentials:'include'}).then(r=>r.json()).then(d=>JSON.stringify(d)).catch(e=>JSON.stringify({error:e.toString()}))"
+            "fetch('" + api_url.replace("'", "\'") + "', {credentials:'include'}).then(r=>r.json()).then(d=>JSON.stringify(d)).catch(e=>JSON.stringify({error:e.toString()}))"
         )
         data = json.loads(resp)
         if "results" in data:
@@ -59,17 +76,20 @@ async def get_all_courses(page):
             return courses
     except Exception as e:
         print(f"[CURSOS] API error: {e}")
-
     try:
         await page.goto(BB_URL.rstrip("/") + "/ultra/stream", wait_until="networkidle", timeout=60000)
         await page.wait_for_timeout(3000)
         links = await page.evaluate(
             """() => {
                 const a = document.querySelectorAll('a[href*="/ultra/courses/"]');
-                const seen = new Set(); const res = [];
+                const seen = new Set();
+                const res = [];
                 a.forEach(el => {
                     const m = el.href.match(/\/ultra\/courses\/([^/]+)/);
-                    if (m && !seen.has(m[1])) { seen.add(m[1]); res.push({id:m[1],name:el.textContent.trim()||m[1]}); }
+                    if (m && !seen.has(m[1])) {
+                        seen.add(m[1]);
+                        res.push({id:m[1], name:el.textContent.trim()||m[1]});
+                    }
                 });
                 return res;
             }"""
@@ -116,19 +136,19 @@ def format_report(all_items, total_courses):
     lima_tz = pytz.timezone("America/Lima")
     now = datetime.now(lima_tz)
     fecha = now.strftime("%d/%m/%Y %H:%M")
-    lines = ["<b>📚 Reporte MBA - UP</b>",
-             f"<i>{fecha} (Lima)</i>",
-             f"Cursos revisados: {total_courses}", ""]
+    lines = ["<b>📚 Reporte MBA - UP</b>", f"<i>{fecha} (Lima)</i>", f"Cursos revisados: {total_courses}", ""]
     if not all_items:
         lines.append("✅ <b>No hay tareas pendientes.</b>")
     else:
         for cname, items in all_items.items():
             if items:
-                lines.append(f"\n<b>📖 {cname}</b>")
+                lines.append(f"
+<b>📖 {cname}</b>")
                 for it in items:
                     lines.append(f"  ⏰ {it.get('name','?')} — {it.get('due','Sin fecha')}")
     lines += ["", "🤖 <i>Bot Alertas MBA - UP</i>"]
-    return "\n".join(lines)
+    return "
+".join(lines)
 
 # ---------------------------------------------------------------------------
 def send_telegram(message):
@@ -171,8 +191,10 @@ async def main():
             send_telegram(report)
         except Exception as e:
             import traceback; traceback.print_exc()
-            try: send_telegram(f"<b>❌ Error Bot MBA</b>\n<code>{str(e)[:200]}</code>")
-            except Exception: pass
+            try:
+                send_telegram(f"<b>❌ Error Bot MBA</b>\n<code>{str(e)[:200]}</code>")
+            except Exception:
+                pass
             raise
         finally:
             await browser.close()
