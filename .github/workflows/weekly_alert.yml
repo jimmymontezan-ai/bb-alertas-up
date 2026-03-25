@@ -1,0 +1,36 @@
+name: Bot UP MBA - Reporte Semanal Blackboard a Telegram
+
+on:
+  schedule:
+    - cron: '0 12 * * 1'
+  workflow_dispatch:
+
+jobs:
+  enviar-reporte:
+    name: Reporte semanal de tareas pendientes MBA
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Descargar codigo del repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Instalar dependencias Python
+        run: pip install -r requirements.txt
+
+      - name: Instalar Chromium para Playwright
+        run: playwright install chromium --with-deps
+
+      - name: Ejecutar bot y enviar reporte a Telegram
+        run: python bb_alert.py
+        env:
+          BB_URL:           ${{ secrets.BB_URL }}
+          BB_USER:          ${{ secrets.BB_USER }}
+          BB_PASS:          ${{ secrets.BB_PASS }}
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
