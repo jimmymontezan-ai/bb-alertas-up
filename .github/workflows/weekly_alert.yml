@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '0 12 * * 1'
   workflow_dispatch:
+    inputs:
+      telegram_token:
+        description: 'Token del Bot de Telegram (para prueba manual)'
+        required: false
+        default: ''
 
 jobs:
   enviar-reporte:
@@ -32,5 +37,5 @@ jobs:
           BB_URL:           ${{ secrets.BB_URL }}
           BB_USER:          ${{ secrets.BB_USER }}
           BB_PASS:          ${{ secrets.BB_PASS }}
-          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_TOKEN:   ${{ inputs.telegram_token || secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
