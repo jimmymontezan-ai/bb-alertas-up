@@ -11,35 +11,101 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 # ---------------------------------------------------------------------------
 async def login(page):
     print("[LOGIN] Abriendo pagina de login...")
-    # Use 'load' to wait for JS resources to execute (not just DOMContentLoaded)
     try:
         await page.goto(BB_URL, wait_until="load", timeout=60000)
     except Exception as e:
-        print(f"[LOGIN] goto con 'load' fallo ({e}), reintentando con domcontentloaded...")
+        print(f"[LOGIN] goto 'load' fallo ({e}), reintentando...")
         await page.goto(BB_URL, wait_until="domcontentloaded", timeout=60000)
 
-    await page.wait_for_timeout(3000)
-    print(f"[LOGIN] URL tras goto: {page.url}")
+    await page.wait_for_timeout(5000)
+    print(f"[LOGIN] URL: {page.url}")
     print(f"[LOGIN] Titulo: {await page.title()}")
 
-    # Try to find the login field — fall back to direct login URL if missing
-    try:
-        await page.wait_for_selector("#loginid", timeout=20000)
-        print("[LOGIN] Formulario encontrado en URL principal")
-    except Exception:
-        print(f"[LOGIN] #loginid no visible en {page.url}, navegando a /webapps/login/")
+    # Print HTML for debugging
+    html_snippet = (await page.content())[:3000]
+    print(f"[LOGIN] HTML inicial:\n{html_snippet}")
+
+    # Try to find username field with multiple selectors
+    username_selector = None
+    for sel in ["#loginid", "input[name='user_id']", "input[name='username']",
+                "input[name='login']", "input[type='text']:visible",
+                "input[autocomplete='username']"]:
+        try:
+            el = page.locator(sel)
+            if await el.count() > 0:
+                username_selector = sel
+                print(f"[LOGIN] Username selector encontrado: {sel}")
+                break
+        except Exception:
+            pass
+
+    if not username_selector:
+        # Fall back to direct login URL
         direct_login = BB_URL.rstrip("/") + "/webapps/login/"
+        print(f"[LOGIN] Navegando a URL directa: {direct_login}")
         try:
             await page.goto(direct_login, wait_until="load", timeout=60000)
         except Exception as e2:
-            print(f"[LOGIN] goto direct_login fallo ({e2}), usando domcontentloaded")
+            print(f"[LOGIN] goto direct fallo ({e2})")
             await page.goto(direct_login, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(3000)
-        print(f"[LOGIN] URL login directo: {page.url}")
-        await page.wait_for_selector("#loginid", timeout=30000)
-        print("[LOGIN] Formulario encontrado en URL directa")
+        await page.wait_for_timeout(5000)
+        print(f"[LOGIN] URL directa actual: {page.url}")
+        html_snippet2 = (await page.content())[:3000]
+        print(f"[LOGIN] HTML directa:\n{html_snippet2}")
 
-    # Cerrar overlay lb-wrapper si existe
+        for sel in ["#loginid", "input[name='user_id']", "input[name='username']",
+                    "input[name='login']", "input[type='text']:visible",
+                    "input[autocomplete='username']"]:
+            try:
+                el = page.locator(sel)
+                if await el.count() > 0:
+                    username_selector = sel
+                    print(f"[LOGIN] Username selector en directa: {sel}")
+                    break
+            except Exception:
+                pass
+
+    if not username_selector:
+        # Last resort: wait 15s and try any visible input
+        print("[LOGIN] Esperando 15s por renderizado JS...")
+        await page.wait_for_timeout(15000)
+        html_snippet3 = (await page.content())[:3000]
+        print(f"[LOGIN] HTML tras espera:\n{html_snippet3}")
+        # List all inputs
+        inputs_info = await page.evaluate(
+            "() => Array.from(document.querySelectorAll('input')).map(i => ({id:i.id,name:i.name,type:i.type,placeholder:i.placeholder}))"
+        )
+        print(f"[LOGIN] Todos los inputs encontrados: {json.dumps(inputs_info)}")
+        for sel in ["#loginid", "input[name='user_id']", "input[name='username']",
+                    "input[name='login']", "input[type='text']", "input[autocomplete='username']"]:
+            try:
+                el = page.locator(sel)
+                if await el.count() > 0:
+                    username_selector = sel
+                    print(f"[LOGIN] Username selector (ultimo intento): {sel}")
+                    break
+            except Exception:
+                pass
+
+    if not username_selector:
+        raise Exception("No se encontro formulario de login. Ver HTML en logs.")
+
+    # Find password selector
+    password_selector = None
+    for sel in ["#pass", "input[name='password']", "input[type='password']"]:
+        try:
+            el = page.locator(sel)
+            if await el.count() > 0:
+                password_selector = sel
+                print(f"[LOGIN] Password selector: {sel}")
+                break
+        except Exception:
+            pass
+
+    if not password_selector:
+        password_selector = "input[type='password']"
+
+    # Close overlay if present
     try:
         ov = page.locator("div.lb-wrapper[role='dialog']")
         if await ov.count() > 0:
@@ -49,13 +115,26 @@ async def login(page):
     except Exception:
         pass
 
-    await page.fill("#loginid", BB_USER)
-    await page.fill("#pass", BB_PASS)
-    # JS click para bypassar overlays que interceptan pointer events
-    try:
-        await page.evaluate("document.querySelector('#entry-login').click()")
-    except Exception:
-        await page.locator("#pass").press("Enter")
+    await page.fill(username_selector, BB_USER)
+    await page.fill(password_selector, BB_PASS)
+
+    # Try to submit
+    submitted = False
+    for submit_sel in ["#entry-login", "input[type='submit']", "button[type='submit']", "button:has-text('Iniciar')", "button:has-text('Login')"]:
+        try:
+            el = page.locator(submit_sel)
+            if await el.count() > 0:
+                await el.first.click()
+                submitted = True
+                print(f"[LOGIN] Submit via {submit_sel}")
+                break
+        except Exception:
+            pass
+
+    if not submitted:
+        print("[LOGIN] Submit via Enter")
+        await page.locator(password_selector).press("Enter")
+
     await page.wait_for_load_state("networkidle", timeout=60000)
     print(f"[LOGIN] Login completado. URL: {page.url}")
 
