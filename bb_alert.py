@@ -213,7 +213,7 @@ def send_telegram(message):
     if not TELEGRAM_CHAT_ID:
         print("[TELEGRAM] ERROR: TELEGRAM_CHAT_ID vacio! Verificar secretos de GitHub.")
         raise ValueError("TELEGRAM_CHAT_ID no configurado")
-    print(f"[TELEGRAM] Token len={len(TELEGRAM_TOKEN)}, inicio={TELEEG	AM_TOKEN[:10]}..., ChatID={TELEGRAM_CHAT_ID}")
+    print(f"[TELEGRAM] Token len={len(TELEGRAM_TOKEN)}, inicio={TELEGRAM_TOKEN[:10]}..., ChatID={TELEGRAM_CHAT_ID}")
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     data = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}).encode()
     req = urllib.request.Request(url, data=data, method="POST")
@@ -221,7 +221,7 @@ def send_telegram(message):
         with urllib.request.urlopen(req, timeout=30) as r:
             res = json.loads(r.read())
         print("[TELEGRAM] OK" if res.get("ok") else f"[TELEGRAM] Error: {res}")
-    except urllib.error.HTTPErtor as e:
+    except urllib.error.HTTPError as e:
         body = e.read().decode('utf-8', errors='replace')
         print(f"[TELEGRAM] HTTP {e.code} {e.reason}: {body}")
         raise
@@ -246,7 +246,7 @@ async def main():
             await login(page)
             courses = await get_all_courses(page)
             if not courses:
-                send_telegram("<b>📠 Reporte MBA</b>\n\n⩠️ No se encontraron cursos.")
+                send_telegram("<b>📚 Reporte MBA</b>\n\n⚠️ No se encontraron cursos.")
                 return
             all_items = {}
             for c in courses:
