@@ -2,10 +2,10 @@ import asyncio, os, re, json, pytz, urllib.request, urllib.parse
 from datetime import datetime
 from playwright.async_api import async_playwright
 
-BB_URL  = os.environ.get("BB_URL",  "https://aulavirtual.up.edu.pe")
-BB_USER = os.environ.get("BB_USER", "")
-BB_PASS = os.environ.get("BB_PASS", "")
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN",   "")
+BB_URL        = os.environ.get("BB_URL", "https://aulavirtual.up.edu.pe")
+BB_USER       = os.environ.get("BB_USER", "")
+BB_PASS       = os.environ.get("BB_PASS", "")
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # ---------------------------------------------------------------------------
@@ -16,20 +16,14 @@ async def login(page):
     except Exception as e:
         print(f"[LOGIN] goto 'load' fallo ({e}), reintentando...")
         await page.goto(BB_URL, wait_until="domcontentloaded", timeout=60000)
-
     await page.wait_for_timeout(5000)
     print(f"[LOGIN] URL: {page.url}")
     print(f"[LOGIN] Titulo: {await page.title()}")
-
-    # Print HTML for debugging
     html_snippet = (await page.content())[:3000]
     print(f"[LOGIN] HTML inicial:\n{html_snippet}")
-
-    # Try to find username field with multiple selectors
     username_selector = None
     for sel in ["#loginid", "input[name='user_id']", "input[name='username']",
-                "input[name='login']", "input[type='text']:visible",
-                "input[autocomplete='username']"]:
+                "input[name='login']", "input[type='text']:visible", "input[autocomplete='username']"]:
         try:
             el = page.locator(sel)
             if await el.count() > 0:
@@ -38,9 +32,7 @@ async def login(page):
                 break
         except Exception:
             pass
-
     if not username_selector:
-        # Fall back to direct login URL
         direct_login = BB_URL.rstrip("/") + "/webapps/login/"
         print(f"[LOGIN] Navegando a URL directa: {direct_login}")
         try:
@@ -52,10 +44,8 @@ async def login(page):
         print(f"[LOGIN] URL directa actual: {page.url}")
         html_snippet2 = (await page.content())[:3000]
         print(f"[LOGIN] HTML directa:\n{html_snippet2}")
-
         for sel in ["#loginid", "input[name='user_id']", "input[name='username']",
-                    "input[name='login']", "input[type='text']:visible",
-                    "input[autocomplete='username']"]:
+                    "input[name='login']", "input[type='text']:visible", "input[autocomplete='username']"]:
             try:
                 el = page.locator(sel)
                 if await el.count() > 0:
@@ -64,14 +54,11 @@ async def login(page):
                     break
             except Exception:
                 pass
-
     if not username_selector:
-        # Last resort: wait 15s and try any visible input
         print("[LOGIN] Esperando 15s por renderizado JS...")
         await page.wait_for_timeout(15000)
         html_snippet3 = (await page.content())[:3000]
         print(f"[LOGIN] HTML tras espera:\n{html_snippet3}")
-        # List all inputs
         inputs_info = await page.evaluate(
             "() => Array.from(document.querySelectorAll('input')).map(i => ({id:i.id,name:i.name,type:i.type,placeholder:i.placeholder}))"
         )
@@ -86,11 +73,8 @@ async def login(page):
                     break
             except Exception:
                 pass
-
     if not username_selector:
         raise Exception("No se encontro formulario de login. Ver HTML en logs.")
-
-    # Find password selector
     password_selector = None
     for sel in ["#pass", "input[name='password']", "input[type='password']"]:
         try:
@@ -101,11 +85,8 @@ async def login(page):
                 break
         except Exception:
             pass
-
     if not password_selector:
         password_selector = "input[type='password']"
-
-    # Close overlay if present
     try:
         ov = page.locator("div.lb-wrapper[role='dialog']")
         if await ov.count() > 0:
@@ -114,13 +95,11 @@ async def login(page):
             await page.wait_for_timeout(1000)
     except Exception:
         pass
-
     await page.fill(username_selector, BB_USER)
     await page.fill(password_selector, BB_PASS)
-
-    # Try to submit
     submitted = False
-    for submit_sel in ["#entry-login", "input[type='submit']", "button[type='submit']", "button:has-text('Iniciar')", "button:has-text('Login')"]:
+    for submit_sel in ["#entry-login", "input[type='submit']", "button[type='submit']",
+                       "button:has-text('Iniciar')", "button:has-text('Login')"]:
         try:
             el = page.locator(submit_sel)
             if await el.count() > 0:
@@ -130,11 +109,9 @@ async def login(page):
                 break
         except Exception:
             pass
-
     if not submitted:
         print("[LOGIN] Submit via Enter")
         await page.locator(password_selector).press("Enter")
-
     await page.wait_for_load_state("networkidle", timeout=60000)
     print(f"[LOGIN] Login completado. URL: {page.url}")
 
@@ -151,8 +128,8 @@ async def get_all_courses(page):
         if "results" in data:
             for c in data["results"]:
                 courses.append({"id": c["id"], "name": c.get("name", c.get("courseId", "?"))})
-            print(f"[CURSOS] {len(courses)} cursos via API")
-            return courses
+        print(f"[CURSOS] {len(courses)} cursos via API")
+        return courses
     except Exception as e:
         print(f"[CURSOS] API error: {e}")
     try:
@@ -175,7 +152,7 @@ async def get_all_courses(page):
         )
         if links:
             courses = links
-            print(f"[CURSOS] {len(courses)} cursos via scraping")
+        print(f"[CURSOS] {len(courses)} cursos via scraping")
     except Exception as e:
         print(f"[CURSOS] scraping error: {e}")
     return courses
@@ -215,7 +192,8 @@ def format_report(all_items, total_courses):
     lima_tz = pytz.timezone("America/Lima")
     now = datetime.now(lima_tz)
     fecha = now.strftime("%d/%m/%Y %H:%M")
-    lines = ["<b>📚 Reporte MBA - UP</b>", f"<i>{fecha} (Lima)</i>", f"Cursos revisados: {total_courses}", ""]
+    lines = ["<b>📚 Reporte MBA - UP</b>", f"<i>{fecha} (Lima)</i>",
+             f"Cursos revisados: {total_courses}", ""]
     if not all_items:
         lines.append("✅ <b>No hay tareas pendientes.</b>")
     else:
@@ -229,12 +207,24 @@ def format_report(all_items, total_courses):
 
 # ---------------------------------------------------------------------------
 def send_telegram(message):
-    url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    if not TELEGRAM_TOKEN:
+        print("[TELEGRAM] ERROR: TELEGRAM_TOKEN vacio! Verificar secretos de GitHub.")
+        raise ValueError("TELEGRAM_TOKEN no configurado")
+    if not TELEGRAM_CHAT_ID:
+        print("[TELEGRAM] ERROR: TELEGRAM_CHAT_ID vacio! Verificar secretos de GitHub.")
+        raise ValueError("TELEGRAM_CHAT_ID no configurado")
+    print(f"[TELEGRAM] Token len={len(TELEGRAM_TOKEN)}, inicio={TELEEG	AM_TOKEN[:10]}..., ChatID={TELEGRAM_CHAT_ID}")
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     data = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}).encode()
-    req  = urllib.request.Request(url, data=data, method="POST")
-    with urllib.request.urlopen(req, timeout=30) as r:
-        res = json.loads(r.read())
+    req = urllib.request.Request(url, data=data, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            res = json.loads(r.read())
         print("[TELEGRAM] OK" if res.get("ok") else f"[TELEGRAM] Error: {res}")
+    except urllib.error.HTTPErtor as e:
+        body = e.read().decode('utf-8', errors='replace')
+        print(f"[TELEGRAM] HTTP {e.code} {e.reason}: {body}")
+        raise
 
 # ---------------------------------------------------------------------------
 async def main():
@@ -256,7 +246,7 @@ async def main():
             await login(page)
             courses = await get_all_courses(page)
             if not courses:
-                send_telegram("<b>📚 Reporte MBA</b>\n\n⚠️ No se encontraron cursos.")
+                send_telegram("<b>📠 Reporte MBA</b>\n\n⩠️ No se encontraron cursos.")
                 return
             all_items = {}
             for c in courses:
