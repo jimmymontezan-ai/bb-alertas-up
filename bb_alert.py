@@ -22,7 +22,7 @@ async def login(page):
     print(f"[LOGIN] URL tras goto: {page.url}")
     print(f"[LOGIN] Titulo: {await page.title()}")
 
-    # Try to find the login field - fall back to direct login URL if missing
+    # Try to find the login field — fall back to direct login URL if missing
     try:
         await page.wait_for_selector("#loginid", timeout=20000)
         print("[LOGIN] Formulario encontrado en URL principal")
@@ -66,7 +66,7 @@ async def get_all_courses(page):
     try:
         api_url = BB_URL.rstrip("/") + "/learn/api/public/v1/courses?availability.available=Yes&fields=id,name,courseId&limit=100"
         resp = await page.evaluate(
-            "fetch('" + api_url.replace("'", "\'") + "', {credentials:'include'}).then(r=>r.json()).then(d=>JSON.stringify(d)).catch(e=>JSON.stringify({error:e.toString()}))"
+            "fetch('" + api_url.replace("'", "\\'") + "', {credentials:'include'}).then(r=>r.json()).then(d=>JSON.stringify(d)).catch(e=>JSON.stringify({error:e.toString()}))"
         )
         data = json.loads(resp)
         if "results" in data:
@@ -85,7 +85,7 @@ async def get_all_courses(page):
                 const seen = new Set();
                 const res = [];
                 a.forEach(el => {
-                    const m = el.href.match(/\/ultra\/courses\/([^/]+)/);
+                    const m = el.href.match(/\\/ultra\\/courses\\/([^/]+)/);
                     if (m && !seen.has(m[1])) {
                         seen.add(m[1]);
                         res.push({id:m[1], name:el.textContent.trim()||m[1]});
@@ -142,13 +142,11 @@ def format_report(all_items, total_courses):
     else:
         for cname, items in all_items.items():
             if items:
-                lines.append(f"
-<b>📖 {cname}</b>")
+                lines.append(f"\n<b>📖 {cname}</b>")
                 for it in items:
                     lines.append(f"  ⏰ {it.get('name','?')} — {it.get('due','Sin fecha')}")
     lines += ["", "🤖 <i>Bot Alertas MBA - UP</i>"]
-    return "
-".join(lines)
+    return "\n".join(lines)
 
 # ---------------------------------------------------------------------------
 def send_telegram(message):
