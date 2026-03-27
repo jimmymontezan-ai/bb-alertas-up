@@ -358,19 +358,27 @@ async def query_courses(page, course_ids, now, lima_tz):
 
     print(f"[COURSES] Total resp: {len(captured)}")
 
-    # Invertir course_ids para lookup id→nombre limpio
+    # Regex para detectar URL de columna individual: .../gradebook/columns/_NNN_1
+    COL_RE = re.compile(r'/gradebook/columns/(_\d+_\d+)$')
+
+    # Lookup id→nombre de curso
     id_to_name = {cid: cname for cid, cname in course_ids.items()}
 
     seen = set()
 
+    def resolve_course(raw_cn):
+        """Convierte courseId o nombre sucio al nombre limpio del curso."""
+        # Si es un Blackboard ID, buscar nombre en id_to_name
+        if re.match(r'^_\d+_\d+$', raw_cn):
+            raw_cn = id_to_name.get(raw_cn, raw_cn)
+        return clean_course_name(raw_cn)
+
     def add_parsed(parsed_item):
         if not parsed_item:
             return
-        cn = parsed_item["course"]
-        # Si el nombre de curso es un ID de Blackboard (_XXXX_1), buscar nombre real
-        if re.match(r'^_\d+_\d+$', cn):
-            cn = id_to_name.get(cn, cn)
-            parsed_item["course"] = cn
+        cn = resolve_course(parsed_item["course"])
+        if not cn or cn == "Sin curso":
+            return
         if cn not in all_items:
             all_items[cn] = []
         k = (cn, parsed_item['task'][:40], parsed_item['due'])
@@ -379,31 +387,19 @@ async def query_courses(page, course_ids, now, lima_tz):
             all_items[cn].append({"name": parsed_item['task'], "due": parsed_item['due']})
 
     for resp in captured:
+        url_path = resp["url"].split("?")[0]
         try:
             data = json.loads(resp["body"])
         except Exception:
             continue
 
-        # ── Parsear objeto top-level (endpoints tipo /gradebook/columns/{id}) ──
-        if isinstance(data, dict) and 'id' in data and 'results' not in data:
+        # ── Solo parsear respuestas de columnas individuales (/gradebook/columns/_ID) ──
+        # Estas son los únicos objetos que tienen dueDate + name = nombre real del assignment
+        if COL_RE.search(url_path) and isinstance(data, dict):
             add_parsed(parse_item_deep(data, now, lima_tz))
 
-        # ── Parsear arrays internos ──
-        arrays = find_arrays_in_json(data)
-        for _, arr in arrays:
-            parsed = parse_items(arr, now, lima_tz)
-            for course, items in parsed.items():
-                cn = course
-                if re.match(r'^_\d+_\d+$', cn):
-                    cn = id_to_name.get(cn, cn)
-                if cn not in all_items:
-                    all_items[cn] = []
-                for it in items:
-                    k = (cn, it['name'][:40], it['due'])
-                    if k not in seen:
-                        seen.add(k)
-                        all_items[cn].append(it)
-
+    task_total = sum(len(v) for v in all_items.values())
+    print(f"[COURSES] {task_total} tareas en columnas de gradebook")
     return all_items
 
 # ---------------------------------------------------------------------------
