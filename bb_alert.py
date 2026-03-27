@@ -2,9 +2,9 @@ import asyncio, os, re, json, pytz, urllib.request, urllib.parse
 from datetime import datetime
 from playwright.async_api import async_playwright
 
-BB_URL        = os.environ.get("BB_URL", "https://aulavirtual.up.edu.pe")
-BB_USER       = os.environ.get("BB_USER", "")
-BB_PASS       = os.environ.get("BB_PASS", "")
+BB_URL           = os.environ.get("BB_URL", "https://aulavirtual.up.edu.pe")
+BB_USER          = os.environ.get("BB_USER", "")
+BB_PASS          = os.environ.get("BB_PASS", "")
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
@@ -122,14 +122,15 @@ async def get_all_courses(page):
     try:
         api_url = BB_URL.rstrip("/") + "/learn/api/public/v1/courses?availability.available=Yes&fields=id,name,courseId&limit=100"
         resp = await page.evaluate(
-            "fetch('" + api_url.replace("'", "\\'") + "', {credentials:'include'}).then(r=>r.json()).then(d=>JSON.stringify(d)).catch(e=>JSON.stringify({error:e.toString()}))"
+            "fetch('" + api_url.replace("'", "\\'") + "', {credentials:'include'})"
+            ".then(r=>r.json()).then(d=>JSON.stringify(d)).catch(e=>JSON.stringify({error:e.toString()}))"
         )
         data = json.loads(resp)
         if "results" in data:
             for c in data["results"]:
                 courses.append({"id": c["id"], "name": c.get("name", c.get("courseId", "?"))})
-        print(f"[CURSOS] {len(courses)} cursos via API")
-        return courses
+            print(f"[CURSOS] {len(courses)} cursos via API")
+            return courses
     except Exception as e:
         print(f"[CURSOS] API error: {e}")
     try:
@@ -138,8 +139,7 @@ async def get_all_courses(page):
         links = await page.evaluate(
             """() => {
                 const a = document.querySelectorAll('a[href*="/ultra/courses/"]');
-                const seen = new Set();
-                const res = [];
+                const seen = new Set(); const res = [];
                 a.forEach(el => {
                     const m = el.href.match(/\\/ultra\\/courses\\/([^/]+)/);
                     if (m && !seen.has(m[1])) {
@@ -152,79 +152,143 @@ async def get_all_courses(page):
         )
         if links:
             courses = links
-        print(f"[CURSOS] {len(courses)} cursos via scraping")
+            print(f"[CURSOS] {len(courses)} cursos via scraping")
     except Exception as e:
         print(f"[CURSOS] scraping error: {e}")
     return courses
 
 # ---------------------------------------------------------------------------
 async def get_gradebook_items(page, course_id, course_name):
+    """Obtiene tareas con fecha FUTURA via REST API de Blackboard (sin navegar al curso)."""
     print(f"[GRADEBOOK] {course_name}")
     items = []
+    lima_tz = pytz.timezone("America/Lima")
+    now = datetime.now(lima_tz)
+
     try:
-        url = BB_URL.rstrip("/") + "/ultra/courses/" + course_id + "/grade/gradebook"
-        await page.goto(url, wait_until="networkidle", timeout=60000)
-        await page.wait_for_timeout(3000)
-        raw = await page.evaluate(
-            """() => {
-                const rows = document.querySelectorAll('[class*="gradebook-row"],[class*="grade-row"],tr[data-item-id]');
-                const res = [];
-                rows.forEach(row => {
-                    const n = row.querySelector('[class*="title"],[class*="name"],td:first-child');
-                    const s = row.querySelector('[class*="score"],[class*="grade"],td:nth-child(2)');
-                    const d = row.querySelector('[class*="due"],[class*="date"]');
-                    if (n) {
-                        const sc = s ? s.textContent.trim() : "";
-                        if (!sc || sc === "-") res.push({name:n.textContent.trim(), due:d?d.textContent.trim():"Sin fecha"});
-                    }
-                });
-                return res;
-            }"""
+        api_url = (BB_URL.rstrip("/") +
+                   f"/learn/api/public/v1/courses/{course_id}/gradebook/columns"
+                   "?fields=id,name,grading&limit=200")
+        resp = await page.evaluate(
+            "fetch('" + api_url.replace("'", "\\'") + "', {credentials:'include'})"
+            ".then(r=>r.json()).then(d=>JSON.stringify(d)).catch(e=>JSON.stringify({error:e.toString()}))"
         )
-        items = raw if isinstance(raw, list) else []
-        print(f"[GRADEBOOK] {len(items)} pendientes")
+        data = json.loads(resp)
+
+        if "results" not in data:
+            print(f"[GRADEBOOK] Sin resultados: {str(data)[:120]}")
+            return items
+
+        future = []
+        for col in data["results"]:
+            grading = col.get("grading", {})
+            due_str = grading.get("due", "")
+            if not due_str:
+                continue
+            try:
+                due_dt = datetime.fromisoformat(due_str.replace("Z", "+00:00"))
+                if due_dt.tzinfo is None:
+                    due_dt = pytz.utc.localize(due_dt)
+                due_lima = due_dt.astimezone(lima_tz)
+                if due_lima.date() <= now.date():
+                    continue              # solo fechas FUTURAS
+                future.append({
+                    "name": col.get("name", "?"),
+                    "due":  due_lima.strftime("%d/%m/%Y"),
+                    "_dt":  due_lima,
+                })
+            except Exception as e:
+                print(f"[GRADEBOOK] date parse error: {e}")
+
+        future.sort(key=lambda x: x["_dt"])
+        for it in future:
+            del it["_dt"]
+        items = future
+        print(f"[GRADEBOOK] {len(items)} tareas futuras")
+
     except Exception as e:
         print(f"[GRADEBOOK] error: {e}")
+
     return items
 
 # ---------------------------------------------------------------------------
-def format_report(all_items, total_courses):
-    lima_tz = pytz.timezone("America/Lima")
-    now = datetime.now(lima_tz)
-    fecha = now.strftime("%d/%m/%Y %H:%M")
-    lines = ["<b>📚 Reporte MBA - UP</b>", f"<i>{fecha} (Lima)</i>",
-             f"Cursos revisados: {total_courses}", ""]
-    if not all_items:
-        lines.append("✅ <b>No hay tareas pendientes.</b>")
-    else:
-        for cname, items in all_items.items():
-            if items:
-                lines.append(f"\n<b>📖 {cname}</b>")
-                for it in items:
-                    lines.append(f"  ⏰ {it.get('name','?')} — {it.get('due','Sin fecha')}")
-    lines += ["", "🤖 <i>Bot Alertas MBA - UP</i>"]
-    return "\n".join(lines)
+def clean_course_name(name: str) -> str:
+    """Extrae el nombre legible del curso."""
+    # Formato "Codigo • Nombre del curso"
+    if "\u2022" in name or "\u2027" in name or " - " in name[:20]:
+        if "•" in name:
+            parts = name.split("•", 1)
+            candidate = parts[-1].strip()
+            if len(candidate) >= 5:
+                name = candidate
+    # Quitar sufijo tipo "-C-MADM91-EPG2025..."
+    m = re.search(r"^(.+?)\s*[-\u2013]\s*[A-Z]{1,5}[-_]", name)
+    if m:
+        candidate = m.group(1).strip()
+        if len(candidate) >= 5:
+            return candidate[:70]
+    return name[:70] if len(name) > 70 else name
 
 # ---------------------------------------------------------------------------
-def send_telegram(message):
+def format_report(all_items: dict, total_courses: int) -> list:
+    """Devuelve lista de mensajes Telegram (<= 4000 chars cada uno)."""
+    lima_tz = pytz.timezone("America/Lima")
+    now     = datetime.now(lima_tz)
+    fecha   = now.strftime("%d/%m/%Y %H:%M")
+
+    header = (
+        "\U0001f4da <b>Reporte MBA - UP</b>\n"
+        f"<i>{fecha} (Lima)</i>\n"
+        f"Cursos revisados: {total_courses}\n"
+    )
+    footer = "\n\U0001f916 <i>Bot Alertas MBA - UP</i>"
+    MAX    = 4000
+
+    courses_with_items = {k: v for k, v in all_items.items() if v}
+    if not courses_with_items:
+        return [header + "\n\u2705 <b>No hay tareas con fecha futura.</b>" + footer]
+
+    messages = []
+    current  = header
+
+    for raw_name, items in courses_with_items.items():
+        cname = clean_course_name(raw_name)
+        block = f"\n\U0001f4d6 <b>{cname}</b>\n"
+        for it in items:
+            block += f"  \u23f0 {it['name']} \u2192 <b>{it['due']}</b>\n"
+
+        if len(current) + len(block) + len(footer) > MAX:
+            messages.append(current + footer)
+            current = block
+        else:
+            current += block
+
+    messages.append(current + footer)
+    return messages
+
+# ---------------------------------------------------------------------------
+def send_telegram(messages: list):
     if not TELEGRAM_TOKEN:
-        print("[TELEGRAM] ERROR: TELEGRAM_TOKEN vacio! Verificar secretos de GitHub.")
         raise ValueError("TELEGRAM_TOKEN no configurado")
     if not TELEGRAM_CHAT_ID:
-        print("[TELEGRAM] ERROR: TELEGRAM_CHAT_ID vacio! Verificar secretos de GitHub.")
         raise ValueError("TELEGRAM_CHAT_ID no configurado")
     print(f"[TELEGRAM] Token len={len(TELEGRAM_TOKEN)}, inicio={TELEGRAM_TOKEN[:10]}..., ChatID={TELEGRAM_CHAT_ID}")
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}).encode()
-    req = urllib.request.Request(url, data=data, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            res = json.loads(r.read())
-        print("[TELEGRAM] OK" if res.get("ok") else f"[TELEGRAM] Error: {res}")
-    except urllib.error.HTTPError as e:
-        body = e.read().decode('utf-8', errors='replace')
-        print(f"[TELEGRAM] HTTP {e.code} {e.reason}: {body}")
-        raise
+    for msg in messages:
+        data = urllib.parse.urlencode({
+            "chat_id":    TELEGRAM_CHAT_ID,
+            "text":       msg,
+            "parse_mode": "HTML",
+        }).encode()
+        req = urllib.request.Request(url, data=data, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                res = json.loads(r.read())
+                print("[TELEGRAM] OK" if res.get("ok") else f"[TELEGRAM] Error: {res}")
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            print(f"[TELEGRAM] HTTP {e.code} {e.reason}: {body}")
+            raise
 
 # ---------------------------------------------------------------------------
 async def main():
@@ -246,20 +310,20 @@ async def main():
             await login(page)
             courses = await get_all_courses(page)
             if not courses:
-                send_telegram("<b>📚 Reporte MBA</b>\n\n⚠️ No se encontraron cursos.")
+                send_telegram(["\U0001f4da Reporte MBA\n\n\u26a0\ufe0f No se encontraron cursos."])
                 return
             all_items = {}
             for c in courses:
                 items = await get_gradebook_items(page, c["id"], c["name"])
                 if items:
                     all_items[c["name"]] = items
-            report = format_report(all_items, len(courses))
-            print(report)
-            send_telegram(report)
+            messages = format_report(all_items, len(courses))
+            print("\n---\n".join(messages))
+            send_telegram(messages)
         except Exception as e:
             import traceback; traceback.print_exc()
             try:
-                send_telegram(f"<b>❌ Error Bot MBA</b>\n<code>{str(e)[:200]}</code>")
+                send_telegram([f"<b>\u274c Error Bot MBA</b>\n<code>{str(e)[:200]}</code>"])
             except Exception:
                 pass
             raise
