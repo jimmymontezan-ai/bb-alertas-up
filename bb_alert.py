@@ -185,13 +185,22 @@ def parse_item_deep(item, now, lima_tz):
     task_name = (
         _localizable_str(get_nested(item, 'dynamicCalendarItemProps', 'title')) or
         _localizable_str(item.get('title')) or
+        get_nested(item, 'column', 'name') or       # gradebook grades response
+        get_nested(item, 'column', 'displayName') or
         get_nested(item, 'source', 'title') or
         get_nested(item, 'source', 'name') or
-        get_nested(item, 'source', 'displayName') or
         get_nested(item, 'event', 'title') or
         item.get('name') or item.get('columnName') or item.get('displayTitle') or
         "Tarea sin nombre"
     )
+
+    # ---- Nombre del curso complementado con info del campo 'column' ----
+    if course_name in ("Sin curso",) or re.match(r'^_\d+_\d+$', str(course_name)):
+        course_name = (
+            get_nested(item, 'column', 'courseId') or
+            get_nested(item, 'column', 'courseName') or
+            course_name
+        )
 
     return {
         "course": str(course_name)[:80],
@@ -328,7 +337,6 @@ async def query_courses(page, course_ids, now, lima_tz):
     print(f"[COURSES] Navegando {len(courses_list)} cursos (grades + outline)...")
 
     for cid, cname in courses_list:
-        # Navegar primero la vista de calificaciones del alumno
         for view in ["grades", "outline"]:
             before = len(captured)
             try:
@@ -340,71 +348,55 @@ async def query_courses(page, course_ids, now, lima_tz):
                 new = len(captured) - before
                 if new > 0:
                     print(f"[COURSE] {cname[:25]} /{view}: {new} resp")
-                    break   # si grades trajo datos, no hace falta outline
+                    break
             except Exception as e:
                 print(f"[COURSE] Error {cid}/{view}: {e}")
 
     page.remove_listener("response", on_response)
-
-    # Log URLs de gradebook/calendar para diagnóstico (solo primeras 8)
-    seen_urls = set()
-    for r in captured:
-        u = r["url"]
-        if any(k in u for k in ["gradebook", "calendar", "column", "assignment"]):
-            short = u.split("?")[0][-80:]
-            if short not in seen_urls:
-                seen_urls.add(short)
-                print(f"[URL] {short}")
-
     print(f"[COURSES] Total resp: {len(captured)}")
-
-    # Debug: mostrar sample de URLs con 'column' para verificar el formato
-    col_sample = [r['url'].split('?')[0] for r in captured if 'column' in r['url'].lower()]
-    for u in col_sample[:5]:
-        print(f"[COL-URL] {u[-90:]}")
-
-    # Regex para detectar URL de columna individual: .../gradebook/columns/_NNN_1
-    COL_RE = re.compile(r'/gradebook/columns/(_\d+_\d+)/?$')
 
     # Lookup id→nombre de curso
     id_to_name = {cid: cname for cid, cname in course_ids.items()}
 
     seen = set()
 
-    def resolve_course(raw_cn):
-        """Convierte courseId o nombre sucio al nombre limpio del curso."""
-        # Si es un Blackboard ID, buscar nombre en id_to_name
-        if re.match(r'^_\d+_\d+$', raw_cn):
-            raw_cn = id_to_name.get(raw_cn, raw_cn)
-        return clean_course_name(raw_cn)
-
-    def add_parsed(parsed_item):
-        if not parsed_item:
-            return
-        cn = resolve_course(parsed_item["course"])
-        if not cn or cn == "Sin curso":
-            return
-        if cn not in all_items:
-            all_items[cn] = []
-        k = (cn, parsed_item['task'][:40], parsed_item['due'])
-        if k not in seen:
-            seen.add(k)
-            all_items[cn].append({"name": parsed_item['task'], "due": parsed_item['due']})
+    # Patrones de URL que no contienen tareas: esquemas, config, usuario, etc.
+    SKIP_PATTERNS = ['/schemas', '/settings', '/featureFlags', '/finalGrade',
+                     '/users/', '/memberships', '/auth/', '/session', '/login']
 
     for resp in captured:
         url_path = resp["url"].split("?")[0]
+        if any(p in url_path for p in SKIP_PATTERNS):
+            continue
         try:
             data = json.loads(resp["body"])
         except Exception:
             continue
 
-        # ── Solo parsear respuestas de columnas individuales (/gradebook/columns/_ID) ──
-        # Estas son los únicos objetos que tienen dueDate + name = nombre real del assignment
-        if COL_RE.search(url_path) and isinstance(data, dict):
-            add_parsed(parse_item_deep(data, now, lima_tz))
+        # Buscar todos los arrays en la respuesta y parsear cada elemento
+        arrays = find_arrays_in_json(data)
+        for _, arr in arrays:
+            for item in arr:
+                parsed = parse_item_deep(item, now, lima_tz)
+                if not parsed:
+                    continue
+                cn = parsed["course"]
+                # Resolver ID de curso a nombre
+                if re.match(r'^_\d+_\d+$', str(cn)):
+                    cn = id_to_name.get(cn, cn)
+                cn = clean_course_name(str(cn))
+                # Descartar si sigue siendo un ID o "Sin curso"
+                if not cn or cn == "Sin curso" or re.match(r'^_\d+_\d+$', cn):
+                    continue
+                if cn not in all_items:
+                    all_items[cn] = []
+                k = (cn, parsed['task'][:40], parsed['due'])
+                if k not in seen:
+                    seen.add(k)
+                    all_items[cn].append({"name": parsed['task'], "due": parsed['due']})
 
     task_total = sum(len(v) for v in all_items.values())
-    print(f"[COURSES] {task_total} tareas en columnas de gradebook")
+    print(f"[COURSES] {task_total} tareas via gradebook")
     return all_items
 
 # ---------------------------------------------------------------------------
@@ -475,35 +467,29 @@ async def get_upcoming_assignments(page):
     # === Paso 2: API directa de calendario con rango 120 días ===
     print("[P2] Consultando API de calendario (120 dias futuros)...")
     cal_items = await call_calendar_api_direct(page, now, lima_tz)
-    if cal_items:
-        # Combinar con lo encontrado en stream
-        for course, items in cal_items.items():
-            if course not in all_items:
-                all_items[course] = []
-            all_items[course].extend(items)
-        total = sum(len(v) for v in all_items.values())
-        print(f"[P2] Total combinado: {total} tareas")
-        return all_items
+    for course, items in cal_items.items():
+        if course not in all_items:
+            all_items[course] = []
+        all_items[course].extend(items)
+    total = sum(len(v) for v in all_items.values())
+    print(f"[P2] {total} tareas tras P1+P2")
 
-    # === Paso 3: Fallback — navegar calendario por fechas futuras ===
+    # === Paso 3: Navegar calendario por fechas futuras ===
     future_pages = ["/ultra/calendar"] + [
         f"/ultra/calendar?date={(now + timedelta(days=d)).strftime('%Y-%m-%d')}"
         for d in [14, 42, 70]
     ]
-    print("[P3] Fallback: navegando calendario por fechas futuras...")
-    cal_page_items, _ = await capture_pages_and_parse(page, now, lima_tz, future_pages)
-    if cal_page_items:
-        for course, items in cal_page_items.items():
-            if course not in all_items:
-                all_items[course] = []
-            all_items[course].extend(items)
-
+    print("[P3] Navegando calendario por fechas futuras...")
+    cal_page_items, extra_ids = await capture_pages_and_parse(page, now, lima_tz, future_pages)
+    for course, items in cal_page_items.items():
+        if course not in all_items:
+            all_items[course] = []
+        all_items[course].extend(items)
+    course_ids.update(extra_ids)
     total = sum(len(v) for v in all_items.values())
-    print(f"[P3] {total} tareas tras navegar calendario")
-    if total > 0:
-        return all_items
+    print(f"[P3] {total} tareas tras P1+P2+P3")
 
-    # === Paso 4: Navegar grades de cada curso (siempre ejecutar para diagnóstico) ===
+    # === Paso 4: SIEMPRE navegar grades de cada curso ===
     if course_ids:
         print("[P4] Navegando grades de cursos individuales...")
         course_items = await query_courses(page, course_ids, now, lima_tz)
