@@ -308,7 +308,7 @@ async def capture_pages_and_parse(page, now, lima_tz, pages_to_visit):
 
 # ---------------------------------------------------------------------------
 async def query_courses(page, course_ids, now, lima_tz):
-    """Para cada curso, navega a su página Ultra y captura datos de tareas."""
+    """Para cada curso navega grades + outline y captura tareas futuras."""
     all_items = {}
     captured = []
 
@@ -324,23 +324,38 @@ async def query_courses(page, course_ids, now, lima_tz):
 
     page.on("response", on_response)
 
-    courses_list = list(course_ids.items())[:15]  # Max 15 cursos
-    print(f"[COURSES] Navegando {len(courses_list)} cursos...")
+    courses_list = list(course_ids.items())[:12]
+    print(f"[COURSES] Navegando {len(courses_list)} cursos (grades + outline)...")
 
     for cid, cname in courses_list:
-        before = len(captured)
-        try:
-            await page.goto(
-                BB_URL.rstrip("/") + f"/ultra/courses/{cid}/outline",
-                wait_until="networkidle", timeout=45000
-            )
-            await page.wait_for_timeout(5000)
-            new = len(captured) - before
-            print(f"[COURSE] {cname[:30]}: {new} resp")
-        except Exception as e:
-            print(f"[COURSE] Error {cid}: {e}")
+        # Navegar primero la vista de calificaciones del alumno
+        for view in ["grades", "outline"]:
+            before = len(captured)
+            try:
+                await page.goto(
+                    BB_URL.rstrip("/") + f"/ultra/courses/{cid}/{view}",
+                    wait_until="networkidle", timeout=45000
+                )
+                await page.wait_for_timeout(4000)
+                new = len(captured) - before
+                if new > 0:
+                    print(f"[COURSE] {cname[:25]} /{view}: {new} resp")
+                    break   # si grades trajo datos, no hace falta outline
+            except Exception as e:
+                print(f"[COURSE] Error {cid}/{view}: {e}")
 
     page.remove_listener("response", on_response)
+
+    # Log URLs de gradebook/calendar para diagnóstico (solo primeras 8)
+    seen_urls = set()
+    for r in captured:
+        u = r["url"]
+        if any(k in u for k in ["gradebook", "calendar", "column", "assignment"]):
+            short = u.split("?")[0][-80:]
+            if short not in seen_urls:
+                seen_urls.add(short)
+                print(f"[URL] {short}")
+
     print(f"[COURSES] Total resp: {len(captured)}")
 
     seen = set()
@@ -459,16 +474,20 @@ async def get_upcoming_assignments(page):
     if total > 0:
         return all_items
 
-    # === Paso 4: Navegar cada curso individualmente ===
+    # === Paso 4: Navegar grades de cada curso (siempre ejecutar para diagnóstico) ===
     if course_ids:
-        print("[P4] Navegando outlines de cursos individuales...")
+        print("[P4] Navegando grades de cursos individuales...")
         course_items = await query_courses(page, course_ids, now, lima_tz)
         total4 = sum(len(v) for v in course_items.values())
-        print(f"[P4] {total4} tareas via cursos individuales")
-        if total4 > 0:
-            return course_items
+        print(f"[P4] {total4} tareas via grades de cursos")
+        for course, items in course_items.items():
+            if course not in all_items:
+                all_items[course] = []
+            all_items[course].extend(items)
 
-    print("[WARN] Sin tareas encontradas en ninguna fuente.")
+    total_final = sum(len(v) for v in all_items.values())
+    if total_final == 0:
+        print("[WARN] Sin tareas encontradas en ninguna fuente.")
     return all_items
 
 # ---------------------------------------------------------------------------
