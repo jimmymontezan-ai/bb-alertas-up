@@ -364,43 +364,112 @@ async def query_courses(page, course_ids, now, lima_tz):
     return all_items
 
 # ---------------------------------------------------------------------------
+async def call_calendar_api_direct(page, now, lima_tz):
+    """Llama al API interno de calendario de Blackboard directamente via fetch del browser."""
+    since = now.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    until = (now.astimezone(pytz.utc) + timedelta(days=120)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    # Intentar múltiples endpoints que Blackboard Ultra puede usar
+    endpoints = [
+        f"/learn/api/v1/calendar/items?calendarType=course&since={since}&until={until}&limit=500",
+        f"/learn/api/v1/calendar/items?since={since}&until={until}&limit=500",
+        f"/api/v1/calendar/items?calendarType=course&since={since}&until={until}&limit=500",
+    ]
+
+    for ep in endpoints:
+        try:
+            result = await page.evaluate(f"""
+            async () => {{
+                try {{
+                    const resp = await fetch('{ep}', {{credentials: 'include', headers: {{'Accept': 'application/json'}}}});
+                    const body = await resp.text();
+                    return {{status: resp.status, body: body}};
+                }} catch(e) {{
+                    return {{error: e.message}};
+                }}
+            }}
+            """)
+            status = result.get('status', 0)
+            print(f"[CAL-API] {ep[:60]}... → HTTP {status}")
+            if status == 200:
+                body = result.get('body', '{}')
+                data = json.loads(body)
+                arrays = find_arrays_in_json(data)
+                all_items = {}
+                seen = set()
+                for _, arr in arrays:
+                    parsed = parse_items(arr, now, lima_tz)
+                    for course, items in parsed.items():
+                        if course not in all_items:
+                            all_items[course] = []
+                        for it in items:
+                            key = (course, it['name'][:40], it['due'])
+                            if key not in seen:
+                                seen.add(key)
+                                all_items[course].append(it)
+                total = sum(len(v) for v in all_items.values())
+                print(f"[CAL-API] {total} tareas futuras encontradas")
+                if total > 0:
+                    return all_items
+        except Exception as e:
+            print(f"[CAL-API] Error: {e}")
+    return {}
+
+
 async def get_upcoming_assignments(page):
     lima_tz = pytz.timezone("America/Lima")
     now = datetime.now(lima_tz)
 
-    # Navegar el calendario a fechas futuras para capturar assignments próximos
-    # (el calendario por defecto solo muestra la semana actual)
-    future_dates = [
-        (now + timedelta(days=14)).strftime("%Y-%m-%d"),
-        (now + timedelta(days=42)).strftime("%Y-%m-%d"),
-    ]
-    pages_to_visit = ["/ultra/stream", "/ultra/calendar"] + \
-                     [f"/ultra/calendar?date={d}" for d in future_dates]
-
-    # === Paso 1: Stream + Calendar → busca tareas y extrae course IDs ===
-    print("[P1] Capturando stream y calendar (+ fechas futuras)...")
+    # === Paso 1: Stream → session activa + course IDs ===
+    print("[P1] Cargando stream (session + course IDs)...")
     all_items, course_ids = await capture_pages_and_parse(
-        page, now, lima_tz,
-        pages_to_visit
+        page, now, lima_tz, ["/ultra/stream"]
     )
     total = sum(len(v) for v in all_items.values())
-    print(f"[P1] {total} tareas, {len(course_ids)} cursos identificados")
+    print(f"[P1] {total} tareas en stream, {len(course_ids)} cursos identificados")
 
+    # === Paso 2: API directa de calendario con rango 120 días ===
+    print("[P2] Consultando API de calendario (120 dias futuros)...")
+    cal_items = await call_calendar_api_direct(page, now, lima_tz)
+    if cal_items:
+        # Combinar con lo encontrado en stream
+        for course, items in cal_items.items():
+            if course not in all_items:
+                all_items[course] = []
+            all_items[course].extend(items)
+        total = sum(len(v) for v in all_items.values())
+        print(f"[P2] Total combinado: {total} tareas")
+        return all_items
+
+    # === Paso 3: Fallback — navegar calendario por fechas futuras ===
+    future_pages = ["/ultra/calendar"] + [
+        f"/ultra/calendar?date={(now + timedelta(days=d)).strftime('%Y-%m-%d')}"
+        for d in [14, 42, 70]
+    ]
+    print("[P3] Fallback: navegando calendario por fechas futuras...")
+    cal_page_items, _ = await capture_pages_and_parse(page, now, lima_tz, future_pages)
+    if cal_page_items:
+        for course, items in cal_page_items.items():
+            if course not in all_items:
+                all_items[course] = []
+            all_items[course].extend(items)
+
+    total = sum(len(v) for v in all_items.values())
+    print(f"[P3] {total} tareas tras navegar calendario")
     if total > 0:
         return all_items
 
-    # === Paso 2: Navegar por cada curso si no encontramos tareas ===
+    # === Paso 4: Navegar cada curso individualmente ===
     if course_ids:
-        print("[P2] Navegando cursos individualmente...")
+        print("[P4] Navegando outlines de cursos individuales...")
         course_items = await query_courses(page, course_ids, now, lima_tz)
-        total2 = sum(len(v) for v in course_items.values())
-        print(f"[P2] {total2} tareas via cursos individuales")
-        if total2 > 0:
+        total4 = sum(len(v) for v in course_items.values())
+        print(f"[P4] {total4} tareas via cursos individuales")
+        if total4 > 0:
             return course_items
 
-    # === Paso 3: Log diagnóstico de lo que hay en la página ===
-    print("[P3] Sin tareas encontradas. Logging items de red para debug...")
-    return {}
+    print("[WARN] Sin tareas encontradas en ninguna fuente.")
+    return all_items
 
 # ---------------------------------------------------------------------------
 def clean_course_name(name: str) -> str:
