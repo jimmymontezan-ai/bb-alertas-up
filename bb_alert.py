@@ -18,7 +18,6 @@ async def login(page):
         await page.goto(BB_URL, wait_until="domcontentloaded", timeout=60000)
     await page.wait_for_timeout(5000)
     print(f"[LOGIN] URL: {page.url}")
-    print(f"[LOGIN] Titulo: {await page.title()}")
 
     username_selector = None
     for sel in ["#loginid", "input[name='user_id']", "input[name='username']",
@@ -40,17 +39,6 @@ async def login(page):
         await page.wait_for_timeout(5000)
         for sel in ["#loginid", "input[name='user_id']", "input[name='username']",
                     "input[name='login']", "input[type='text']:visible"]:
-            try:
-                if await page.locator(sel).count() > 0:
-                    username_selector = sel
-                    break
-            except Exception:
-                pass
-
-    if not username_selector:
-        await page.wait_for_timeout(15000)
-        for sel in ["#loginid", "input[name='user_id']", "input[name='username']",
-                    "input[name='login']", "input[type='text']"]:
             try:
                 if await page.locator(sel).count() > 0:
                     username_selector = sel
@@ -96,74 +84,39 @@ async def login(page):
     print(f"[LOGIN] Completado. URL: {page.url}")
 
 # ---------------------------------------------------------------------------
-async def get_user_id(page):
-    try:
-        resp = await page.evaluate(
-            "fetch('/learn/api/public/v1/users/me', {credentials:'include'})"
-            ".then(r=>r.json()).then(d=>JSON.stringify(d)).catch(e=>JSON.stringify({error:e.toString()}))"
-        )
-        data = json.loads(resp)
-        uid = data.get("id", data.get("userId", ""))
-        print(f"[USER] id={uid}  data={str(data)[:200]}")
-        return uid
-    except Exception as e:
-        print(f"[USER] error: {e}")
-        return ""
-
-# ---------------------------------------------------------------------------
-async def try_various_apis(page, user_id, now, lima_tz):
-    """Intenta varios endpoints REST y devuelve items si encuentra algo."""
-    since = now.strftime("%Y-%m-%dT00:00:00.000Z")
-    until = (now + timedelta(days=120)).strftime("%Y-%m-%dT23:59:59.000Z")
-
-    apis = [
-        # Calendario (v1, v2)
-        f"/learn/api/public/v1/calendar/items?since={since}&until={until}&limit=200",
-        f"/learn/api/public/v2/calendar/items?since={since}&until={until}&limit=200",
-        # Stream activities
-        "/learn/api/public/v1/streams/activities?limit=100",
-        "/learn/api/public/v2/streams/activities?limit=100",
-        # User memberships
-        "/learn/api/public/v1/users/me/memberships?limit=100&fields=courseId,courseRoleId,lastAccessDate",
-        f"/learn/api/public/v1/users/{user_id}/memberships?limit=100" if user_id else None,
-        # Upcoming / todo
-        "/learn/api/public/v1/users/me/upcoming?limit=100",
-        "/learn/api/public/v2/users/me/upcoming?limit=100",
-        "/learn/api/public/v1/users/me/todo?limit=100",
-    ]
-
-    for api in apis:
-        if not api:
-            continue
-        url = BB_URL.rstrip("/") + api
-        try:
-            resp = await page.evaluate(
-                f"fetch('{url}', {{credentials:'include'}})"
-                ".then(r=>r.json()).then(d=>JSON.stringify(d)).catch(e=>JSON.stringify({error:e.toString()}))"
-            )
-            data = json.loads(resp)
-            status = data.get("status", "")
-            count = len(data.get("results", data.get("items", [])))
-            print(f"[API] {api[:70]}: status={status} count={count} raw={str(data)[:150]}")
-
-            if count > 0:
-                items = data.get("results", data.get("items", []))
-                all_items = parse_items(items, now, lima_tz)
-                if all_items:
-                    return all_items
-        except Exception as e:
-            print(f"[API] {api[:70]}: error={e}")
-
-    return {}
+def find_arrays_in_json(data, depth=0, prefix=""):
+    """Busca recursivamente todos los arrays con items en un objeto JSON."""
+    found = []
+    if depth > 4:
+        return found
+    if isinstance(data, list) and len(data) > 0:
+        found.append((prefix or "root", data))
+    elif isinstance(data, dict):
+        for key, val in data.items():
+            path = f"{prefix}.{key}" if prefix else key
+            if isinstance(val, list) and len(val) > 0:
+                found.append((path, val))
+            elif isinstance(val, dict):
+                found.extend(find_arrays_in_json(val, depth+1, path))
+    return found
 
 # ---------------------------------------------------------------------------
 def parse_items(items, now, lima_tz):
-    """Parsea una lista de items y extrae assignments con fecha futura."""
+    """Parsea una lista de items buscando assignments con fecha futura."""
     all_items = {}
     for item in items:
-        # Buscar campo de fecha en varias posibles claves
-        due_str = (item.get("end") or item.get("start") or item.get("dueDate") or
-                   item.get("due") or item.get("endDate") or "")
+        if not isinstance(item, dict):
+            continue
+        # Buscar fecha en muchas posibles claves
+        due_str = ""
+        for key in ["end", "start", "dueDate", "due", "endDate", "dateEnd",
+                    "deadline", "submissionDate", "closeDate", "date",
+                    "dateAvailable", "datePublished"]:
+            val = item.get(key, "")
+            if val and isinstance(val, str) and len(val) >= 8:
+                due_str = val
+                break
+
         if not due_str:
             continue
         try:
@@ -173,10 +126,28 @@ def parse_items(items, now, lima_tz):
             due_lima = due_dt.astimezone(lima_tz)
             if due_lima.date() <= now.date():
                 continue
-            course_name = (item.get("calendarName") or item.get("courseName") or
-                           item.get("courseId") or item.get("calendarId") or "Sin curso")
-            task_name = (item.get("title") or item.get("name") or
-                         item.get("columnName") or "?")
+            # Buscar nombre del curso
+            course_name = ""
+            for key in ["calendarName", "courseName", "courseId", "calendarId",
+                        "course", "courseTitle", "contextLabel", "context"]:
+                val = item.get(key, "")
+                if val and isinstance(val, str) and len(val) >= 3:
+                    course_name = val
+                    break
+            if not course_name:
+                course_name = "Sin curso"
+
+            # Buscar nombre de la tarea
+            task_name = ""
+            for key in ["title", "name", "columnName", "description",
+                        "subject", "displayTitle", "label"]:
+                val = item.get(key, "")
+                if val and isinstance(val, str) and len(val) >= 2:
+                    task_name = val
+                    break
+            if not task_name:
+                task_name = "Tarea sin nombre"
+
             if course_name not in all_items:
                 all_items[course_name] = []
             all_items[course_name].append({
@@ -185,7 +156,7 @@ def parse_items(items, now, lima_tz):
                 "_dt":  due_lima,
             })
         except Exception as e:
-            print(f"[PARSE] date error: {e}")
+            pass
 
     for cn in all_items:
         all_items[cn].sort(key=lambda x: x["_dt"])
@@ -194,133 +165,353 @@ def parse_items(items, now, lima_tz):
     return all_items
 
 # ---------------------------------------------------------------------------
-async def intercept_stream_page(page, now, lima_tz):
-    """Navega al stream de Ultra e intercepta todas las respuestas JSON de la API."""
+async def get_memberships(page):
+    """Obtiene los cursos del estudiante via API de memberships."""
+    try:
+        resp = await page.evaluate("""
+            fetch('/learn/api/public/v1/users/me/memberships?limit=200&expand=course', {credentials:'include'})
+            .then(r=>r.json()).then(d=>JSON.stringify(d)).catch(e=>JSON.stringify({error:e.toString()}))
+        """)
+        data = json.loads(resp)
+        courses = data.get("results", [])
+        print(f"[MEMBER] {len(courses)} cursos encontrados, keys={list(data.keys())[:10]}")
+        # Extraer course IDs y nombres
+        course_info = []
+        for c in courses:
+            cid = c.get("courseId", c.get("id", ""))
+            # Try to get course name from expanded course data
+            course_obj = c.get("course", {})
+            cname = course_obj.get("name", course_obj.get("displayName", c.get("courseName", cid)))
+            if cid:
+                course_info.append({"id": cid, "name": cname})
+        return course_info
+    except Exception as e:
+        print(f"[MEMBER] error: {e}")
+        return []
+
+# ---------------------------------------------------------------------------
+async def get_course_assignments(page, course_id, course_name, now, lima_tz):
+    """Obtiene assignments de un curso via su contenido o gradebook."""
+    all_items = {}
+    since = now.strftime("%Y-%m-%dT00:00:00.000Z")
+    until = (now + timedelta(days=120)).strftime("%Y-%m-%dT23:59:59.000Z")
+
+    # Intentar gradebook grades (estudiante puede ver sus propias notas)
+    try:
+        resp = await page.evaluate(f"""
+            fetch('/learn/api/public/v2/courses/{course_id}/gradebook/columns?limit=100', {{credentials:'include'}})
+            .then(r=>r.json()).then(d=>JSON.stringify(d)).catch(e=>JSON.stringify({{error:e.toString()}}))
+        """)
+        data = json.loads(resp)
+        status = data.get("status", 200)
+        if status not in [401, 403, 404]:
+            cols = data.get("results", [])
+            print(f"[COURSE] {course_id[:20]} gradebook v2: {len(cols)} cols")
+            for col in cols:
+                due_str = col.get("due", col.get("dueDate", ""))
+                if not due_str:
+                    continue
+                try:
+                    due_dt = datetime.fromisoformat(due_str.replace("Z", "+00:00"))
+                    if due_dt.tzinfo is None:
+                        due_dt = pytz.utc.localize(due_dt)
+                    due_lima = due_dt.astimezone(lima_tz)
+                    if due_lima.date() > now.date():
+                        if course_name not in all_items:
+                            all_items[course_name] = []
+                        all_items[course_name].append({
+                            "name": col.get("name", col.get("displayName", "Tarea")),
+                            "due": due_lima.strftime("%d/%m/%Y"),
+                            "_dt": due_lima,
+                        })
+                except Exception:
+                    pass
+    except Exception as e:
+        pass
+
+    return all_items
+
+# ---------------------------------------------------------------------------
+async def intercept_all_pages(page, now, lima_tz):
+    """Navega por varias páginas capturando TODAS las respuestas JSON."""
     captured = []
 
     async def on_response(response):
         ct = response.headers.get("content-type", "")
-        if "json" in ct and any(k in response.url for k in ["/api/", "learn/api", "/ultra/"]):
+        if "json" in ct:
             try:
                 body = await response.text()
-                captured.append({"url": response.url, "body": body})
+                if len(body) > 10:
+                    captured.append({"url": response.url, "body": body})
             except Exception:
                 pass
 
     page.on("response", on_response)
-    try:
-        await page.goto(BB_URL.rstrip("/") + "/ultra/stream",
-                        wait_until="networkidle", timeout=90000)
-        await page.wait_for_timeout(5000)
-        # Scroll para cargar mas contenido
-        for _ in range(3):
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await page.wait_for_timeout(2000)
-    except Exception as e:
-        print(f"[STREAM] navigation error: {e}")
-    finally:
-        page.remove_listener("response", on_response)
 
-    print(f"[INTERCEPT] {len(captured)} respuestas JSON capturadas")
+    pages_to_try = [
+        "/ultra/stream",
+        "/ultra/calendar",
+    ]
 
-    # Analizar respuestas capturadas
+    for ultra_page in pages_to_try:
+        try:
+            cap_before = len(captured)
+            await page.goto(BB_URL.rstrip("/") + ultra_page,
+                            wait_until="networkidle", timeout=60000)
+            await page.wait_for_timeout(8000)
+            # Scroll para cargar mas contenido
+            for _ in range(5):
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await page.wait_for_timeout(1500)
+            new_captured = len(captured) - cap_before
+            print(f"[INTERCEPT] Pagina {ultra_page}: {new_captured} respuestas JSON nuevas")
+        except Exception as e:
+            print(f"[INTERCEPT] Error en {ultra_page}: {e}")
+
+    page.remove_listener("response", on_response)
+    print(f"[INTERCEPT] Total: {len(captured)} respuestas JSON capturadas")
+
+    # Analizar TODAS las respuestas buscando arrays con datos de tareas
     all_items = {}
+    seen_url_patterns = set()
+
     for resp in captured:
         try:
             data = json.loads(resp["body"])
-            results = data.get("results", data.get("items", []))
-            if not results:
-                continue
-            print(f"[INTERCEPT] {resp['url'][-80:]}: {len(results)} items sample={str(results[0])[:150]}")
-            parsed = parse_items(results, now, lima_tz)
-            for course, items in parsed.items():
-                if course not in all_items:
-                    all_items[course] = []
-                all_items[course].extend(items)
         except Exception:
-            pass
+            continue
 
-    if all_items:
-        return all_items
+        # Buscar TODOS los arrays en la respuesta
+        arrays_found = find_arrays_in_json(data)
+        for key_path, arr in arrays_found:
+            if len(arr) == 0:
+                continue
+            # Intentar parsear como items de calendario/tarea
+            parsed = parse_items(arr, now, lima_tz)
+            if parsed:
+                url_short = resp["url"][-60:] if len(resp["url"]) > 60 else resp["url"]
+                print(f"[INTERCEPT] TAREAS ENCONTRADAS! key='{key_path}' url=...{url_short}")
+                for course, items in parsed.items():
+                    if course not in all_items:
+                        all_items[course] = []
+                    all_items[course].extend(items)
+            else:
+                # Log los primeros arrays con items (para debug)
+                url_pattern = resp["url"].split("?")[0][-50:]
+                if url_pattern not in seen_url_patterns and len(arr) > 0:
+                    sample = arr[0] if isinstance(arr[0], dict) else {}
+                    keys = list(sample.keys())[:8] if sample else []
+                    print(f"[SCAN] key='{key_path}' n={len(arr)} campos={keys}")
+                    seen_url_patterns.add(url_pattern)
 
-    # Si no se obtuvo nada, intentar scraping del DOM
-    print("[DOM] Intentando scraping del DOM del stream...")
-    return await scrape_stream_dom(page, now, lima_tz)
+    return all_items
 
 # ---------------------------------------------------------------------------
-async def scrape_stream_dom(page, now, lima_tz):
-    """Extrae assignments del DOM renderizado del activity stream."""
+async def extract_shadow_dom_text(page):
+    """Extrae todo el texto visible incluyendo Shadow DOM de forma recursiva."""
     try:
-        dom_text = await page.evaluate("""
+        text_data = await page.evaluate("""
             () => {
-                // Buscar elementos con fechas futuras
-                const items = [];
+                const results = [];
 
-                // Patrones de selectores comunes en Blackboard Ultra
-                const containers = document.querySelectorAll(
-                    '[class*="activity"], [class*="stream-item"], [class*="card"], ' +
-                    '[class*="upcoming"], [class*="grade-row"], article, ' +
-                    '[data-is-active], bb-base-stream-entry'
-                );
-
-                containers.forEach(el => {
-                    const text = el.textContent.trim();
-                    // Buscar texto con patrones de fecha
-                    if (text.match(/\\d{1,2}[\\/-]\\d{1,2}[\\/-]\\d{2,4}/) ||
-                        text.match(/(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\\s+\\d/) ||
-                        text.match(/Due/i) || text.match(/Entrega/i) || text.match(/Vence/i)) {
-                        items.push(text.slice(0, 300));
+                function collectFromRoot(root, depth) {
+                    if (depth > 20) return;
+                    // Collect text nodes
+                    const walker = document.createTreeWalker(
+                        root, NodeFilter.SHOW_TEXT, null, false
+                    );
+                    let node;
+                    while (node = walker.nextNode()) {
+                        const t = node.nodeValue ? node.nodeValue.trim() : '';
+                        if (t.length > 1) results.push(t);
                     }
-                });
+                    // Recurse into shadow roots
+                    const allEls = root.querySelectorAll('*');
+                    allEls.forEach(el => {
+                        if (el.shadowRoot) {
+                            collectFromRoot(el.shadowRoot, depth + 1);
+                        }
+                    });
+                }
 
-                // Tambien buscar elementos time con datetime
-                document.querySelectorAll('time[datetime]').forEach(el => {
-                    const parent = el.closest('[class]');
-                    items.push((parent || el).textContent.trim().slice(0, 300));
-                });
-
-                return [...new Set(items)].slice(0, 100);
+                collectFromRoot(document, 0);
+                return results;
             }
         """)
-        print(f"[DOM] {len(dom_text)} elementos encontrados")
-        for i, item in enumerate(dom_text[:20]):
-            print(f"[DOM] [{i}] {item[:150]}")
+        print(f"[SHADOW] {len(text_data)} fragmentos de texto extraidos")
+        return text_data
     except Exception as e:
-        print(f"[DOM] error: {e}")
+        print(f"[SHADOW] error: {e}")
+        return []
 
-    # Si llegamos aqui, no encontramos datos estructurados
-    # Devolver vacio - el reporte dira "no hay tareas"
-    return {}
+# ---------------------------------------------------------------------------
+def parse_text_for_assignments(text_fragments, now, lima_tz):
+    """Parsea una lista de fragmentos de texto buscando fechas y nombres de tareas."""
+    # Patrones de fecha comunes
+    date_patterns = [
+        # dd/mm/yyyy or dd-mm-yyyy
+        (r'(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})', 'dmy'),
+        # Month dd, yyyy (English)
+        (r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+(\d{1,2}),?\s+(\d{4})', 'mdy_en'),
+        # dd de Month de yyyy (Spanish)
+        (r'(\d{1,2})\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\s+de\s+(\d{4})', 'dmy_es'),
+        # yyyy-mm-dd
+        (r'(\d{4})-(\d{2})-(\d{2})', 'ymd'),
+    ]
+
+    months_es = {
+        'enero':1,'febrero':2,'marzo':3,'abril':4,'mayo':5,'junio':6,
+        'julio':7,'agosto':8,'septiembre':9,'octubre':10,'noviembre':11,'diciembre':12
+    }
+    months_en = {
+        'jan':1,'feb':2,'mar':3,'apr':4,'may':5,'jun':6,
+        'jul':7,'aug':8,'sep':9,'oct':10,'nov':11,'dec':12
+    }
+
+    def try_parse_date(text):
+        for pattern, fmt in date_patterns:
+            m = re.search(pattern, text, re.IGNORECASE)
+            if m:
+                try:
+                    if fmt == 'dmy':
+                        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                    elif fmt == 'mdy_en':
+                        mo = months_en.get(m.group(1).lower()[:3], 0)
+                        d, y = int(m.group(2)), int(m.group(3))
+                    elif fmt == 'dmy_es':
+                        d = int(m.group(1))
+                        mo = months_es.get(m.group(2).lower(), 0)
+                        y = int(m.group(3))
+                    elif fmt == 'ymd':
+                        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                    else:
+                        continue
+                    if mo < 1 or mo > 12 or d < 1 or d > 31:
+                        continue
+                    dt = datetime(y, mo, d, tzinfo=lima_tz)
+                    return dt
+                except Exception:
+                    continue
+        return None
+
+    # Buscar pares texto-con-fecha
+    all_items = {}
+    # Juntamos fragmentos consecutivos para contexto
+    for i, frag in enumerate(text_fragments):
+        dt = try_parse_date(frag)
+        if not dt:
+            continue
+        if dt.date() <= now.date():
+            continue
+        # Buscar nombre de tarea en fragmentos cercanos
+        context = text_fragments[max(0, i-5):i+3]
+        task_name = ""
+        course_name = "Sin curso"
+        for ctx in context:
+            ctx = ctx.strip()
+            # Si el fragmento tiene palabras reales y no es solo fecha
+            if (len(ctx) > 5 and not re.match(r'^[\d:/\s]+$', ctx)
+                    and 'Due' not in ctx and 'Entrega' not in ctx
+                    and 'Vence' not in ctx and len(ctx) < 200):
+                if not task_name:
+                    task_name = ctx[:80]
+                elif not course_name or course_name == "Sin curso":
+                    course_name = ctx[:70]
+
+        if task_name and len(task_name) > 3:
+            if course_name not in all_items:
+                all_items[course_name] = []
+            all_items[course_name].append({
+                "name": task_name,
+                "due": dt.strftime("%d/%m/%Y"),
+                "_dt": dt,
+            })
+
+    for cn in all_items:
+        all_items[cn].sort(key=lambda x: x["_dt"])
+        for it in all_items[cn]:
+            del it["_dt"]
+
+    # Deduplicar
+    for cn in all_items:
+        seen = set()
+        unique = []
+        for it in all_items[cn]:
+            key = (it["name"][:40], it["due"])
+            if key not in seen:
+                seen.add(key)
+                unique.append(it)
+        all_items[cn] = unique
+
+    return all_items
 
 # ---------------------------------------------------------------------------
 async def get_upcoming_assignments(page):
     """Orquesta todas las estrategias para obtener assignments pendientes."""
     lima_tz = pytz.timezone("America/Lima")
-    now     = datetime.now(lima_tz)
+    now = datetime.now(lima_tz)
 
-    # Paso 1: obtener user ID
-    user_id = await get_user_id(page)
+    # === ESTRATEGIA 1: Memberships + gradebook por curso ===
+    courses = await get_memberships(page)
+    print(f"[STRAT1] {len(courses)} cursos matriculados")
 
-    # Paso 2: probar APIs REST directas
-    all_items = await try_various_apis(page, user_id, now, lima_tz)
-    if all_items:
-        print(f"[RESULT] {sum(len(v) for v in all_items.values())} tareas via API directa")
+    all_items = {}
+    if courses:
+        for course in courses[:30]:  # Max 30 cursos para no tardar demasiado
+            items = await get_course_assignments(page, course["id"], course["name"], now, lima_tz)
+            for cn, tasks in items.items():
+                if cn not in all_items:
+                    all_items[cn] = []
+                all_items[cn].extend(tasks)
+
+    total_s1 = sum(len(v) for v in all_items.values())
+    print(f"[STRAT1] {total_s1} tareas encontradas via gradebook")
+
+    if total_s1 > 0:
         return all_items
 
-    # Paso 3: interceptar stream + DOM
-    all_items = await intercept_stream_page(page, now, lima_tz)
-    print(f"[RESULT] {sum(len(v) for v in all_items.values())} tareas via stream/DOM")
+    # === ESTRATEGIA 2: Intercepción de red en páginas Ultra ===
+    print("[STRAT2] Interceptando respuestas de red...")
+    all_items = await intercept_all_pages(page, now, lima_tz)
+    total_s2 = sum(len(v) for v in all_items.values())
+    print(f"[STRAT2] {total_s2} tareas encontradas via intercepcion")
+
+    if total_s2 > 0:
+        return all_items
+
+    # === ESTRATEGIA 3: Shadow DOM text extraction ===
+    print("[STRAT3] Extrayendo texto via Shadow DOM...")
+    # Navegar al stream (ya deberia estar ahi desde estrategia 2)
+    try:
+        if "/ultra/" not in page.url:
+            await page.goto(BB_URL.rstrip("/") + "/ultra/stream",
+                           wait_until="networkidle", timeout=60000)
+            await page.wait_for_timeout(8000)
+    except Exception as e:
+        print(f"[STRAT3] error navegacion: {e}")
+
+    text_fragments = await extract_shadow_dom_text(page)
+    all_items = parse_text_for_assignments(text_fragments, now, lima_tz)
+    total_s3 = sum(len(v) for v in all_items.values())
+    print(f"[STRAT3] {total_s3} tareas encontradas via shadow DOM text")
+
+    # Log fragmentos con fechas para debug
+    if total_s3 == 0:
+        date_frags = [f for f in text_fragments if re.search(r'\d{1,2}[/\-]\d{1,2}[/\-]\d{4}|\d{4}-\d{2}-\d{2}', f)]
+        print(f"[DEBUG] {len(date_frags)} fragmentos con fechas:")
+        for f in date_frags[:20]:
+            print(f"  DATE: {f[:100]}")
+
     return all_items
 
 # ---------------------------------------------------------------------------
 def clean_course_name(name: str) -> str:
-    if "\u2022" in name or " - " in name[:20]:
-        if "•" in name:
-            parts = name.split("•", 1)
-            candidate = parts[-1].strip()
-            if len(candidate) >= 5:
-                name = candidate
-    m = re.search(r"^(.+?)\s*[-\u2013]\s*[A-Z]{1,5}[-_]", name)
+    if "•" in name:
+        parts = name.split("•", 1)
+        candidate = parts[-1].strip()
+        if len(candidate) >= 5:
+            name = candidate
+    m = re.search(r"^(.+?)\s*[-–]\s*[A-Z]{1,5}[-_]", name)
     if m:
         candidate = m.group(1).strip()
         if len(candidate) >= 5:
@@ -335,24 +526,24 @@ def format_report(all_items: dict) -> list:
 
     total = sum(len(v) for v in all_items.values())
     header = (
-        "\U0001f4da <b>Reporte MBA - UP</b>\n"
+        "📚 <b>Reporte MBA - UP</b>\n"
         f"<i>{fecha} (Lima)</i>\n"
         f"Tareas encontradas: {total}\n"
     )
-    footer = "\n\U0001f916 <i>Bot Alertas MBA - UP</i>"
+    footer = "\n🤖 <i>Bot Alertas MBA - UP</i>"
     MAX    = 4000
 
     courses_with_items = {k: v for k, v in all_items.items() if v}
     if not courses_with_items:
-        return [header + "\n\u2705 <b>No hay tareas con fecha futura.</b>" + footer]
+        return [header + "\n✅ <b>No hay tareas con fecha futura.</b>" + footer]
 
     messages = []
     current  = header
     for raw_name, items in courses_with_items.items():
         cname = clean_course_name(raw_name)
-        block = f"\n\U0001f4d6 <b>{cname}</b>\n"
+        block = f"\n📖 <b>{cname}</b>\n"
         for it in items:
-            block += f"  \u23f0 {it['name']} \u2192 <b>{it['due']}</b>\n"
+            block += f"  ⏰ {it['name']} → <b>{it['due']}</b>\n"
         if len(current) + len(block) + len(footer) > MAX:
             messages.append(current + footer)
             current = block
@@ -367,7 +558,7 @@ def send_telegram(messages: list):
         raise ValueError("TELEGRAM_TOKEN no configurado")
     if not TELEGRAM_CHAT_ID:
         raise ValueError("TELEGRAM_CHAT_ID no configurado")
-    print(f"[TELEGRAM] Token len={len(TELEGRAM_TOKEN)}, ChatID={TELEGRAM_CHAT_ID}")
+    print(f"[TELEGRAM] Enviando {len(messages)} mensaje(s)...")
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     for msg in messages:
         data = urllib.parse.urlencode({
@@ -410,7 +601,7 @@ async def main():
         except Exception as e:
             import traceback; traceback.print_exc()
             try:
-                send_telegram([f"<b>\u274c Error Bot MBA</b>\n<code>{str(e)[:200]}</code>"])
+                send_telegram([f"<b>❌ Error Bot MBA</b>\n<code>{str(e)[:200]}</code>"])
             except Exception:
                 pass
             raise
