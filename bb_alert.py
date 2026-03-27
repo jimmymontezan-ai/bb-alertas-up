@@ -368,11 +368,20 @@ async def get_upcoming_assignments(page):
     lima_tz = pytz.timezone("America/Lima")
     now = datetime.now(lima_tz)
 
+    # Navegar el calendario a fechas futuras para capturar assignments próximos
+    # (el calendario por defecto solo muestra la semana actual)
+    future_dates = [
+        (now + timedelta(days=14)).strftime("%Y-%m-%d"),
+        (now + timedelta(days=42)).strftime("%Y-%m-%d"),
+    ]
+    pages_to_visit = ["/ultra/stream", "/ultra/calendar"] + \
+                     [f"/ultra/calendar?date={d}" for d in future_dates]
+
     # === Paso 1: Stream + Calendar → busca tareas y extrae course IDs ===
-    print("[P1] Capturando stream y calendar...")
+    print("[P1] Capturando stream y calendar (+ fechas futuras)...")
     all_items, course_ids = await capture_pages_and_parse(
         page, now, lima_tz,
-        ["/ultra/stream", "/ultra/calendar"]
+        pages_to_visit
     )
     total = sum(len(v) for v in all_items.values())
     print(f"[P1] {total} tareas, {len(course_ids)} cursos identificados")
@@ -395,16 +404,18 @@ async def get_upcoming_assignments(page):
 
 # ---------------------------------------------------------------------------
 def clean_course_name(name: str) -> str:
+    # Formato Blackboard Ultra: "EPG2025_CODE-C-MADM91: Nombre del Curso-C-MADM91-CODE"
+    # Extraer la parte después del primer ": "
+    if ': ' in name:
+        name = name.split(': ', 1)[1].strip()
+    # Eliminar códigos de sección al final: "-C-MADM91-EPG2025_..." etc.
+    name = re.sub(r'-[A-Z]-[A-Z0-9]{4,}.*$', '', name).strip()
+    # Formato alternativo con "•"
     if "•" in name:
         parts = name.split("•", 1)
         candidate = parts[-1].strip()
         if len(candidate) >= 5:
             name = candidate
-    m = re.search(r"^(.+?)\s*[-–]\s*[A-Z]{1,5}[-_]", name)
-    if m:
-        candidate = m.group(1).strip()
-        if len(candidate) >= 5:
-            return candidate[:70]
     return name[:70] if len(name) > 70 else name
 
 # ---------------------------------------------------------------------------
