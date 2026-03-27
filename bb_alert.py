@@ -358,23 +358,51 @@ async def query_courses(page, course_ids, now, lima_tz):
 
     print(f"[COURSES] Total resp: {len(captured)}")
 
+    # Invertir course_ids para lookup id→nombre limpio
+    id_to_name = {cid: cname for cid, cname in course_ids.items()}
+
     seen = set()
+
+    def add_parsed(parsed_item):
+        if not parsed_item:
+            return
+        cn = parsed_item["course"]
+        # Si el nombre de curso es un ID de Blackboard (_XXXX_1), buscar nombre real
+        if re.match(r'^_\d+_\d+$', cn):
+            cn = id_to_name.get(cn, cn)
+            parsed_item["course"] = cn
+        if cn not in all_items:
+            all_items[cn] = []
+        k = (cn, parsed_item['task'][:40], parsed_item['due'])
+        if k not in seen:
+            seen.add(k)
+            all_items[cn].append({"name": parsed_item['task'], "due": parsed_item['due']})
+
     for resp in captured:
         try:
             data = json.loads(resp["body"])
         except Exception:
             continue
+
+        # ── Parsear objeto top-level (endpoints tipo /gradebook/columns/{id}) ──
+        if isinstance(data, dict) and 'id' in data and 'results' not in data:
+            add_parsed(parse_item_deep(data, now, lima_tz))
+
+        # ── Parsear arrays internos ──
         arrays = find_arrays_in_json(data)
         for _, arr in arrays:
             parsed = parse_items(arr, now, lima_tz)
             for course, items in parsed.items():
-                if course not in all_items:
-                    all_items[course] = []
+                cn = course
+                if re.match(r'^_\d+_\d+$', cn):
+                    cn = id_to_name.get(cn, cn)
+                if cn not in all_items:
+                    all_items[cn] = []
                 for it in items:
-                    key = (course, it['name'][:40], it['due'])
-                    if key not in seen:
-                        seen.add(key)
-                        all_items[course].append(it)
+                    k = (cn, it['name'][:40], it['due'])
+                    if k not in seen:
+                        seen.add(k)
+                        all_items[cn].append(it)
 
     return all_items
 
