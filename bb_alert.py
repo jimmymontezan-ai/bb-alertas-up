@@ -113,9 +113,27 @@ def get_nested(obj, *keys):
 
 _logged_structures = set()
 
+def _localizable_str(val):
+    """Extrae texto de un campo localizable de Blackboard (puede ser str u objeto)."""
+    if isinstance(val, str) and val.strip():
+        return val.strip()
+    if isinstance(val, dict):
+        for k in ['rawValue', 'displayValue', 'value', 'en', 'es']:
+            v = val.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return None
+
 def parse_item_deep(item, now, lima_tz):
     """Parsea un item de Blackboard buscando fecha de entrega futura en cualquier nivel."""
     if not isinstance(item, dict):
+        return None
+
+    # Excluir registros de matrícula (no son tareas asignadas)
+    if 'role' in item and 'userId' in item:
+        return None
+    # Excluir eventos de analytics
+    if 'se_id' in item or 'providerId' in item:
         return None
 
     due_str = find_due_date_recursive(item)
@@ -128,10 +146,16 @@ def parse_item_deep(item, now, lima_tz):
         _logged_structures.add(sig)
         top_keys = list(item.keys())[:12]
         print(f"[STRUCT] top keys: {top_keys}")
-        for sub_k in ['source', 'context', 'event', 'course', 'gradeColumn', 'content']:
+        # Log raw values of key fields (regardless of type)
+        for fld in ['title', 'calendarName', 'calendarNameLocalizable', 'dynamicCalendarItemProps',
+                    'itemSourceType', 'itemSourceId', 'calendarId']:
+            val = item.get(fld)
+            if val is not None:
+                print(f"[STRUCT] {fld}={str(val)[:120]}")
+        for sub_k in ['source', 'context', 'event', 'course']:
             sub = item.get(sub_k)
             if isinstance(sub, dict):
-                print(f"[STRUCT] .{sub_k} keys: {list(sub.keys())[:10]}")
+                print(f"[STRUCT] .{sub_k} keys={list(sub.keys())[:8]} sample={str(sub)[:100]}")
 
     try:
         due_dt = datetime.fromisoformat(due_str.replace("Z", "+00:00"))
@@ -145,6 +169,7 @@ def parse_item_deep(item, now, lima_tz):
 
     # ---- Nombre del curso (buscar en varios lugares) ----
     course_name = (
+        _localizable_str(item.get('calendarNameLocalizable')) or
         get_nested(item, 'context', 'courseName') or
         get_nested(item, 'context', 'course', 'name') or
         get_nested(item, 'context', 'course', 'displayName') or
@@ -158,12 +183,13 @@ def parse_item_deep(item, now, lima_tz):
 
     # ---- Nombre de la tarea ----
     task_name = (
+        _localizable_str(get_nested(item, 'dynamicCalendarItemProps', 'title')) or
+        _localizable_str(item.get('title')) or
         get_nested(item, 'source', 'title') or
         get_nested(item, 'source', 'name') or
         get_nested(item, 'source', 'displayName') or
         get_nested(item, 'event', 'title') or
-        item.get('title') or item.get('name') or
-        item.get('columnName') or item.get('displayTitle') or
+        item.get('name') or item.get('columnName') or item.get('displayTitle') or
         "Tarea sin nombre"
     )
 
