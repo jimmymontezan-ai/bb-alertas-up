@@ -111,6 +111,8 @@ def get_nested(obj, *keys):
             return None
     return obj
 
+_logged_structures = set()
+
 def parse_item_deep(item, now, lima_tz):
     """Parsea un item de Blackboard buscando fecha de entrega futura en cualquier nivel."""
     if not isinstance(item, dict):
@@ -119,6 +121,17 @@ def parse_item_deep(item, now, lima_tz):
     due_str = find_due_date_recursive(item)
     if not due_str:
         return None
+
+    # Log estructura del item (solo las primeras veces para no saturar)
+    sig = str(sorted(item.keys()))[:60]
+    if sig not in _logged_structures and len(_logged_structures) < 5:
+        _logged_structures.add(sig)
+        top_keys = list(item.keys())[:12]
+        print(f"[STRUCT] top keys: {top_keys}")
+        for sub_k in ['source', 'context', 'event', 'course', 'gradeColumn', 'content']:
+            sub = item.get(sub_k)
+            if isinstance(sub, dict):
+                print(f"[STRUCT] .{sub_k} keys: {list(sub.keys())[:10]}")
 
     try:
         due_dt = datetime.fromisoformat(due_str.replace("Z", "+00:00"))
