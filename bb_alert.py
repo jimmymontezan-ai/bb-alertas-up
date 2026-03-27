@@ -1,5 +1,5 @@
 import asyncio, os, re, json, pytz, urllib.request, urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta
 from playwright.async_api import async_playwright
 
 BB_URL           = os.environ.get("BB_URL", "https://aulavirtual.up.edu.pe")
@@ -116,100 +116,131 @@ async def login(page):
     print(f"[LOGIN] Login completado. URL: {page.url}")
 
 # ---------------------------------------------------------------------------
-async def get_all_courses(page):
-    print("[CURSOS] Buscando cursos...")
-    courses = []
-    try:
-        api_url = BB_URL.rstrip("/") + "/learn/api/public/v1/courses?availability.available=Yes&fields=id,name,courseId&limit=100"
-        resp = await page.evaluate(
-            "fetch('" + api_url.replace("'", "\\'") + "', {credentials:'include'})"
-            ".then(r=>r.json()).then(d=>JSON.stringify(d)).catch(e=>JSON.stringify({error:e.toString()}))"
-        )
-        data = json.loads(resp)
-        if "results" in data:
-            for c in data["results"]:
-                courses.append({"id": c["id"], "name": c.get("name", c.get("courseId", "?"))})
-            print(f"[CURSOS] {len(courses)} cursos via API")
-            return courses
-    except Exception as e:
-        print(f"[CURSOS] API error: {e}")
-    try:
-        await page.goto(BB_URL.rstrip("/") + "/ultra/stream", wait_until="networkidle", timeout=60000)
-        await page.wait_for_timeout(3000)
-        links = await page.evaluate(
-            """() => {
-                const a = document.querySelectorAll('a[href*="/ultra/courses/"]');
-                const seen = new Set(); const res = [];
-                a.forEach(el => {
-                    const m = el.href.match(/\\/ultra\\/courses\\/([^/]+)/);
-                    if (m && !seen.has(m[1])) {
-                        seen.add(m[1]);
-                        res.push({id:m[1], name:el.textContent.trim()||m[1]});
-                    }
-                });
-                return res;
-            }"""
-        )
-        if links:
-            courses = links
-            print(f"[CURSOS] {len(courses)} cursos via scraping")
-    except Exception as e:
-        print(f"[CURSOS] scraping error: {e}")
-    return courses
+async def get_calendar_items(page):
+    """Obtiene TODOS los assignments con fecha futura via API de Calendario de Blackboard."""
+    lima_tz = pytz.timezone("America/Lima")
+    now     = datetime.now(lima_tz)
+    since   = now.strftime("%Y-%m-%dT00:00:00.000Z")
+    until   = (now + timedelta(days=120)).strftime("%Y-%m-%dT23:59:59.000Z")
+
+    print(f"[CALENDAR] Buscando assignments desde {since[:10]} hasta {until[:10]}...")
+
+    all_items = {}   # course_name -> [ {name, due, _dt} ]
+
+    # Intentar con v1 y v2
+    for version in ["v1", "v2"]:
+        api_url = (BB_URL.rstrip("/") +
+                   f"/learn/api/public/{version}/calendar/items"
+                   f"?type=GradeColumn&since={since}&until={until}&limit=200")
+        try:
+            resp = await page.evaluate(
+                "fetch('" + api_url.replace("'", "\\'") + "', {credentials:'include'})"
+                ".then(r=>r.json()).then(d=>JSON.stringify(d)).catch(e=>JSON.stringify({error:e.toString()}))"
+            )
+            data = json.loads(resp)
+            print(f"[CALENDAR] {version} respuesta: {str(data)[:200]}")
+
+            if "results" in data and data["results"]:
+                print(f"[CALENDAR] {version} OK - {len(data['results'])} items")
+                for item in data["results"]:
+                    due_str = item.get("end", "") or item.get("start", "")
+                    if not due_str:
+                        continue
+                    try:
+                        due_dt = datetime.fromisoformat(due_str.replace("Z", "+00:00"))
+                        if due_dt.tzinfo is None:
+                            due_dt = pytz.utc.localize(due_dt)
+                        due_lima = due_dt.astimezone(lima_tz)
+                        if due_lima.date() <= now.date():
+                            continue
+
+                        course_name = (item.get("calendarName") or
+                                       item.get("courseId") or
+                                       item.get("calendarId") or "Sin curso")
+                        task_name   = item.get("title") or item.get("calendarName") or "?"
+
+                        if course_name not in all_items:
+                            all_items[course_name] = []
+                        all_items[course_name].append({
+                            "name": task_name,
+                            "due":  due_lima.strftime("%d/%m/%Y"),
+                            "_dt":  due_lima,
+                        })
+                    except Exception as e:
+                        print(f"[CALENDAR] date parse error: {e}")
+                # Ordenar cada curso por fecha
+                for cn in all_items:
+                    all_items[cn].sort(key=lambda x: x["_dt"])
+                    for it in all_items[cn]:
+                        del it["_dt"]
+                print(f"[CALENDAR] {sum(len(v) for v in all_items.values())} tareas en {len(all_items)} cursos")
+                return all_items
+            else:
+                print(f"[CALENDAR] {version} sin resultados o error: {str(data)[:300]}")
+        except Exception as e:
+            print(f"[CALENDAR] {version} error: {e}")
+
+    # Fallback: navegar al stream y leer actividades pendientes via scraping
+    print("[CALENDAR] Fallback: intentando scraping del activity stream...")
+    all_items = await get_stream_items(page)
+    return all_items
 
 # ---------------------------------------------------------------------------
-async def get_gradebook_items(page, course_id, course_name):
-    """Obtiene tareas con fecha FUTURA via REST API de Blackboard (sin navegar al curso)."""
-    print(f"[GRADEBOOK] {course_name}")
-    items = []
+async def get_stream_items(page):
+    """Fallback: obtiene actividades pendientes del activity stream de Ultra."""
     lima_tz = pytz.timezone("America/Lima")
-    now = datetime.now(lima_tz)
+    now     = datetime.now(lima_tz)
+    all_items = {}
 
     try:
-        api_url = (BB_URL.rstrip("/") +
-                   f"/learn/api/public/v1/courses/{course_id}/gradebook/columns"
-                   "?fields=id,name,grading&limit=200")
+        stream_url = BB_URL.rstrip("/") + "/ultra/stream"
+        await page.goto(stream_url, wait_until="networkidle", timeout=60000)
+        await page.wait_for_timeout(5000)
+
+        # Intentar API del stream
+        api_url = BB_URL.rstrip("/") + "/learn/api/public/v1/streams/activities?limit=200"
         resp = await page.evaluate(
             "fetch('" + api_url.replace("'", "\\'") + "', {credentials:'include'})"
             ".then(r=>r.json()).then(d=>JSON.stringify(d)).catch(e=>JSON.stringify({error:e.toString()}))"
         )
         data = json.loads(resp)
+        print(f"[STREAM] respuesta: {str(data)[:300]}")
 
-        if "results" not in data:
-            print(f"[GRADEBOOK] Sin resultados: {str(data)[:120]}")
-            return items
+        if "results" in data:
+            for item in data["results"]:
+                due_str = (item.get("dueDate") or item.get("due") or
+                           item.get("endDate") or "")
+                if not due_str:
+                    continue
+                try:
+                    due_dt = datetime.fromisoformat(due_str.replace("Z", "+00:00"))
+                    if due_dt.tzinfo is None:
+                        due_dt = pytz.utc.localize(due_dt)
+                    due_lima = due_dt.astimezone(lima_tz)
+                    if due_lima.date() <= now.date():
+                        continue
+                    course_name = item.get("courseName") or item.get("courseId") or "Sin curso"
+                    task_name   = item.get("title") or item.get("name") or "?"
+                    if course_name not in all_items:
+                        all_items[course_name] = []
+                    all_items[course_name].append({
+                        "name": task_name,
+                        "due":  due_lima.strftime("%d/%m/%Y"),
+                        "_dt":  due_lima,
+                    })
+                except Exception as e:
+                    print(f"[STREAM] date parse error: {e}")
 
-        future = []
-        for col in data["results"]:
-            grading = col.get("grading", {})
-            due_str = grading.get("due", "")
-            if not due_str:
-                continue
-            try:
-                due_dt = datetime.fromisoformat(due_str.replace("Z", "+00:00"))
-                if due_dt.tzinfo is None:
-                    due_dt = pytz.utc.localize(due_dt)
-                due_lima = due_dt.astimezone(lima_tz)
-                if due_lima.date() <= now.date():
-                    continue              # solo fechas FUTURAS
-                future.append({
-                    "name": col.get("name", "?"),
-                    "due":  due_lima.strftime("%d/%m/%Y"),
-                    "_dt":  due_lima,
-                })
-            except Exception as e:
-                print(f"[GRADEBOOK] date parse error: {e}")
-
-        future.sort(key=lambda x: x["_dt"])
-        for it in future:
-            del it["_dt"]
-        items = future
-        print(f"[GRADEBOOK] {len(items)} tareas futuras")
+            for cn in all_items:
+                all_items[cn].sort(key=lambda x: x["_dt"])
+                for it in all_items[cn]:
+                    del it["_dt"]
+            print(f"[STREAM] {sum(len(v) for v in all_items.values())} tareas en {len(all_items)} cursos")
 
     except Exception as e:
-        print(f"[GRADEBOOK] error: {e}")
+        print(f"[STREAM] error: {e}")
 
-    return items
+    return all_items
 
 # ---------------------------------------------------------------------------
 def clean_course_name(name: str) -> str:
@@ -308,16 +339,9 @@ async def main():
         page.set_default_timeout(60000)
         try:
             await login(page)
-            courses = await get_all_courses(page)
-            if not courses:
-                send_telegram(["\U0001f4da Reporte MBA\n\n\u26a0\ufe0f No se encontraron cursos."])
-                return
-            all_items = {}
-            for c in courses:
-                items = await get_gradebook_items(page, c["id"], c["name"])
-                if items:
-                    all_items[c["name"]] = items
-            messages = format_report(all_items, len(courses))
+            all_items = await get_calendar_items(page)
+            total_courses = len(all_items) if all_items else 0
+            messages = format_report(all_items, total_courses)
             print("\n---\n".join(messages))
             send_telegram(messages)
         except Exception as e:
