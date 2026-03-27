@@ -358,8 +358,13 @@ async def query_courses(page, course_ids, now, lima_tz):
 
     print(f"[COURSES] Total resp: {len(captured)}")
 
+    # Debug: mostrar sample de URLs con 'column' para verificar el formato
+    col_sample = [r['url'].split('?')[0] for r in captured if 'column' in r['url'].lower()]
+    for u in col_sample[:5]:
+        print(f"[COL-URL] {u[-90:]}")
+
     # Regex para detectar URL de columna individual: .../gradebook/columns/_NNN_1
-    COL_RE = re.compile(r'/gradebook/columns/(_\d+_\d+)$')
+    COL_RE = re.compile(r'/gradebook/columns/(_\d+_\d+)/?$')
 
     # Lookup id→nombre de curso
     id_to_name = {cid: cname for cid, cname in course_ids.items()}
